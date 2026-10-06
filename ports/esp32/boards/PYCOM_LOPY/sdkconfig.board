@@ -1,0 +1,2 @@
+# Pycom LoPy: 4MiB flash, no PSRAM.
+# Uses the default partitions-4MiBplus.csv from sdkconfig.base.
