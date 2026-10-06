@@ -221,9 +221,18 @@ static void require_if(mp_obj_t wlan_if, int if_no) {
 
 void esp_initialise_wifi(void) {
     static int wifi_initialized = 0;
+    static esp_event_handler_instance_t wifi_handler = NULL;
+    static esp_event_handler_instance_t ip_handler = NULL;
     if (!wifi_initialized) {
-        esp_exceptions(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, network_wlan_wifi_event_handler, NULL, NULL));
-        esp_exceptions(esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, network_wlan_ip_event_handler, NULL, NULL));
+        // Every step below is undone if a later one fails, so a retry
+        // starts from a clean state.  Creating the default netifs twice
+        // trips an assertion in ESP-IDF.
+        esp_exceptions(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, network_wlan_wifi_event_handler, NULL, &wifi_handler));
+        esp_err_t err = esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, network_wlan_ip_event_handler, NULL, &ip_handler);
+        if (err != ESP_OK) {
+            esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_handler);
+            esp_exceptions(err);
+        }
 
         wlan_sta_obj.base.type = &esp_network_wlan_type;
         wlan_sta_obj.if_id = ESP_IF_WIFI_STA;
@@ -254,11 +263,20 @@ void esp_initialise_wifi(void) {
         }
         #endif
         ESP_LOGD("modnetwork", "Initializing WiFi");
-        esp_exceptions(esp_wifi_init(&cfg));
+        err = esp_wifi_init(&cfg);
+        if (err != ESP_OK) {
+            esp_netif_destroy_default_wifi(wlan_sta_obj.netif);
+            esp_netif_destroy_default_wifi(wlan_ap_obj.netif);
+            wlan_sta_obj.netif = NULL;
+            wlan_ap_obj.netif = NULL;
+            esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID, ip_handler);
+            esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_handler);
+            esp_exceptions(err);
+        }
+        wifi_initialized = 1;
         esp_exceptions(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
         ESP_LOGD("modnetwork", "Initialized");
-        wifi_initialized = 1;
     }
 }
 
