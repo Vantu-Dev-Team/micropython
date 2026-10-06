@@ -1,0 +1,3 @@
+# Pycom LoPy4: 8MiB flash, 4MiB PSRAM.
+
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
