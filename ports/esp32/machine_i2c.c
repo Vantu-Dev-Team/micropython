@@ -126,6 +126,13 @@ static uint8_t *create_transfer_buffer(size_t n, mp_machine_i2c_buf_t *bufs, siz
 int machine_hw_i2c_transfer(mp_obj_base_t *self_in, uint16_t addr, size_t n, mp_machine_i2c_buf_t *bufs, unsigned int flags) {
     machine_hw_i2c_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
+    // The driver ends every transfer with a STOP (and resets a bus left busy
+    // before the next one), so a transfer without STOP cannot be honoured;
+    // refuse it instead of sending a STOP the caller asked not to send.
+    if (!(flags & MP_MACHINE_I2C_FLAG_STOP)) {
+        return -MP_EOPNOTSUPP;
+    }
+
     esp_err_t err = ESP_OK;
     err = i2c_master_device_change_address(self->dev_handle, addr, self->timeout_us / 1000);
     if (err != ESP_OK) {
