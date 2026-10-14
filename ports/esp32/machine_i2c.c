@@ -40,6 +40,8 @@
 
 #if MICROPY_HW_ESP_NEW_I2C_DRIVER
 #include "driver/i2c_master.h"
+#include "esp_clk_tree.h"
+#include "hal/i2c_ll.h"
 
 #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 5, 2)
 #error The new I2C driver requires esp-idf >= v5.5.2
@@ -57,6 +59,20 @@ typedef struct _machine_hw_i2c_obj_t {
 } machine_hw_i2c_obj_t;
 
 static machine_hw_i2c_obj_t machine_hw_i2c_obj[I2C_NUM_MAX];
+
+// The timeout is the longest the bus waits for a target that holds SCL low
+// (clock stretching).  The controller's timeout register has a limit (about
+// 13 ms on the ESP32), so clamp to it here: the driver would clamp too, but
+// it logs a warning on every transfer when it has to.
+static uint32_t machine_hw_i2c_scl_wait_us(uint32_t timeout_us) {
+    uint32_t sclk_hz = 0;
+    if (esp_clk_tree_src_get_freq_hz((soc_module_clk_t)I2C_CLK_SRC_DEFAULT,
+        ESP_CLK_TREE_SRC_FREQ_PRECISION_APPROX, &sclk_hz) != ESP_OK || sclk_hz == 0) {
+        return 0; // driver default
+    }
+    uint64_t max_us = (uint64_t)I2C_LL_MAX_TIMEOUT_PERIOD * 1000000ULL / sclk_hz;
+    return timeout_us > max_us ? (uint32_t)max_us : timeout_us;
+}
 
 static void machine_hw_i2c_init(machine_hw_i2c_obj_t *self, bool first_init) {
 
@@ -83,6 +99,7 @@ static void machine_hw_i2c_init(machine_hw_i2c_obj_t *self, bool first_init) {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = 0,  // Will be replaced
         .scl_speed_hz = self->freq,
+        .scl_wait_us = machine_hw_i2c_scl_wait_us(self->timeout_us),
     };
     ESP_ERROR_CHECK(i2c_master_bus_add_device(self->bus_handle, &dev_cfg, &self->dev_handle));
 }
