@@ -210,6 +210,9 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(esp32_partition_readblocks_obj, 3, 4,
 
 static mp_obj_t esp32_partition_writeblocks(size_t n_args, const mp_obj_t *args) {
     esp32_partition_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    #ifdef MICROPY_HW_FLASH_WRITE_GUARD
+    MICROPY_HW_FLASH_WRITE_GUARD(self->part->address, self->part->size);
+    #endif
     uint32_t offset = mp_obj_get_int(args[1]) * self->block_size;
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(args[2], &bufinfo, MP_BUFFER_READ);
@@ -262,6 +265,9 @@ static mp_obj_t esp32_partition_ioctl(mp_obj_t self_in, mp_obj_t cmd_in, mp_obj_
         case MP_BLOCKDEV_IOCTL_BLOCK_SIZE:
             return MP_OBJ_NEW_SMALL_INT(self->block_size);
         case MP_BLOCKDEV_IOCTL_BLOCK_ERASE: {
+            #ifdef MICROPY_HW_FLASH_WRITE_GUARD
+            MICROPY_HW_FLASH_WRITE_GUARD(self->part->address, self->part->size);
+            #endif
             if (self->block_size != NATIVE_BLOCK_SIZE_BYTES) {
                 return MP_OBJ_NEW_SMALL_INT(-MP_EINVAL);
             }
