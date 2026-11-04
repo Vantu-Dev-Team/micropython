@@ -53,7 +53,19 @@ static machine_wdt_obj_t *mp_machine_wdt_make_new_instance(mp_obj_t id, mp_int_t
         .idle_core_mask = 0,
         .trigger_panic = true,
     };
-    mp_int_t rs_code = esp_task_wdt_reconfigure(&config);
+    mp_int_t rs_code;
+    #if !CONFIG_ESP_TASK_WDT_INIT
+    // Boards may leave the watchdog off until Python explicitly opts in.
+    if (wdt_default.twdt_user_handle == NULL) {
+        rs_code = esp_task_wdt_init(&config);
+        if (rs_code == ESP_ERR_INVALID_STATE) {
+            rs_code = esp_task_wdt_reconfigure(&config);
+        }
+    } else
+    #endif
+    {
+        rs_code = esp_task_wdt_reconfigure(&config);
+    }
     if (rs_code != ESP_OK) {
         mp_raise_OSError(rs_code);
     }
