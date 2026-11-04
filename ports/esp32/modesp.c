@@ -69,6 +69,9 @@ static mp_obj_t esp_flash_write_(mp_obj_t offset_in, mp_obj_t buf_in) {
     mp_int_t offset = mp_obj_get_int(offset_in);
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(buf_in, &bufinfo, MP_BUFFER_READ);
+    #ifdef MICROPY_HW_FLASH_WRITE_GUARD
+    MICROPY_HW_FLASH_WRITE_GUARD(offset, bufinfo.len);
+    #endif
     esp_err_t res = esp_flash_write(NULL, bufinfo.buf, offset, bufinfo.len);
     if (res != ESP_OK) {
         mp_raise_OSError(MP_EIO);
@@ -79,6 +82,12 @@ static MP_DEFINE_CONST_FUN_OBJ_2(esp_flash_write_obj, esp_flash_write_);
 
 static mp_obj_t esp_flash_erase(mp_obj_t sector_in) {
     mp_int_t sector = mp_obj_get_int(sector_in);
+    #ifdef MICROPY_HW_FLASH_WRITE_GUARD
+    if (sector < 0 || (mp_uint_t)sector > UINT32_MAX / 4096) {
+        mp_raise_OSError(MP_EPERM);
+    }
+    MICROPY_HW_FLASH_WRITE_GUARD((uint32_t)sector * 4096, 4096);
+    #endif
     esp_err_t res = esp_flash_erase_region(NULL, sector * 4096, 4096);
     if (res != ESP_OK) {
         mp_raise_OSError(MP_EIO);
