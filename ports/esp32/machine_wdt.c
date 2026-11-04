@@ -54,6 +54,12 @@ static machine_wdt_obj_t *mp_machine_wdt_make_new_instance(mp_obj_t id, mp_int_t
         .trigger_panic = true,
     };
     mp_int_t rs_code = esp_task_wdt_reconfigure(&config);
+    #if !CONFIG_ESP_TASK_WDT_INIT
+    // Boards may leave the watchdog off until Python explicitly opts in.
+    if (rs_code == ESP_ERR_INVALID_STATE) {
+        rs_code = esp_task_wdt_init(&config);
+    }
+    #endif
     if (rs_code != ESP_OK) {
         mp_raise_OSError(rs_code);
     }
