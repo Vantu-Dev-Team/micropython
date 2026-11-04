@@ -561,11 +561,8 @@ void TAMP_STAMP_IRQHandler(void) {
 #endif
 
 #if !defined(STM32U5)
-#if defined(STM32H5)
+#if defined(STM32H5) || defined(STM32N6)
 void RTC_IRQHandler(void)
-#elif defined(STM32N6)
-#define RTC_WKUP_IRQn RTC_S_IRQn
-void RTC_S_IRQHandler(void)
 #else
 void RTC_WKUP_IRQHandler(void)
 #endif
@@ -582,12 +579,6 @@ void RTC_WKUP_IRQHandler(void)
     #endif
     Handle_EXTI_Irq(EXTI_RTC_WAKEUP); // clear EXTI flag and execute optional callback
     IRQ_EXIT(RTC_WKUP_IRQn);
-}
-#endif
-
-#if defined(STM32N6)
-void RTC_IRQHandler(void) {
-    RTC_S_IRQHandler();
 }
 #endif
 
@@ -730,6 +721,9 @@ void TIM3_IRQHandler(void) {
 void TIM4_IRQHandler(void) {
     IRQ_ENTER(TIM4_IRQn);
     timer_irq_handler(4);
+    #if MICROPY_HW_ENABLE_SERVO && MICROPY_HW_SERVO_TIM == 4
+    HAL_TIM_IRQHandler(&servo_tim_handle);
+    #endif
     IRQ_EXIT(TIM4_IRQn);
 }
 #endif
@@ -737,7 +731,9 @@ void TIM4_IRQHandler(void) {
 void TIM5_IRQHandler(void) {
     IRQ_ENTER(TIM5_IRQn);
     timer_irq_handler(5);
-    HAL_TIM_IRQHandler(&TIM5_Handle);
+    #if MICROPY_HW_SERVO_TIM == 5
+    HAL_TIM_IRQHandler(&servo_tim_handle);
+    #endif
     IRQ_EXIT(TIM5_IRQn);
 }
 

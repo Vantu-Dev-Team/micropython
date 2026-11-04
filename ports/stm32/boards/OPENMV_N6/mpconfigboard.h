@@ -101,9 +101,16 @@
 
 // SD Card SDMMC
 // SD_VSELECT: low(default)=3.3V IO, high=1.8V IO
-// SD_RESET: drive low to turn off SD VCC (pulled high by default)
+// SD_RESET: drive low to turn off SD VCC (pulled high by default on UHS-I capable
+//   hardware, in which case it reads high at startup; reads low otherwise)
 // SD_DETECT: pulled high in hardware, goes low when SD inserted
 #define MICROPY_HW_SDCARD_SDMMC             (1)
+#define MICROPY_HW_SDCARD_VSELECT_PIN       (pyb_pin_SD_VSELECT)
+#define MICROPY_HW_SDCARD_RESET_PIN         (pyb_pin_SD_RESET)
+#define MICROPY_HW_SDCARD_SUPPORTS_UHS_PIN  (pyb_pin_SD_RESET)
+// UHS-I SDR104 at 200MHz (the SDMMC kernel clock is HCLK at 200MHz).
+#define MICROPY_HW_SDCARD_UHS_SWITCH_PATTERN (SDMMC_SDR104_SWITCH_PATTERN)
+#define MICROPY_HW_SDCARD_UHS_CLK_DIV       (0)
 #define MICROPY_HW_SDCARD_CK                (pyb_pin_SD_SDIO_CK)
 #define MICROPY_HW_SDCARD_CMD               (pyb_pin_SD_SDIO_CMD)
 #define MICROPY_HW_SDCARD_D0                (pyb_pin_SD_SDIO_D0)
@@ -157,6 +164,18 @@
 #define CYW43_CHIPSET_FIRMWARE_INCLUDE_FILE     "lib/cyw43-driver/firmware/w43439_sdio_1yn_7_95_59_combined.h"
 #define CYW43_WIFI_NVRAM_INCLUDE_FILE           "lib/cyw43-driver/firmware/wifi_nvram_1yn.h"
 #define CYW43_BT_FIRMWARE_INCLUDE_FILE          "lib/cyw43-driver/firmware/cyw43_btfw_1yn.h"
+
+// Morse Micro MM8108 802.11ah shield
+#if MICROPY_PY_NETWORK_HALOW_MORSE_MICRO
+#define MICROPY_HW_HALOW_MORSE_MICRO_SPI_ID                 (2)             // P0/P1/P2 are SPI2
+#define MICROPY_HW_HALOW_MORSE_MICRO_CS                     (pyb_pin_P3)
+#define MICROPY_HW_HALOW_MORSE_MICRO_IRQ                    (pyb_pin_P8)
+#define MICROPY_HW_HALOW_MORSE_MICRO_RESET                  (pyb_pin_P7)
+#define MICROPY_HW_HALOW_MORSE_MICRO_WAKE                   (pyb_pin_P9)
+#define MICROPY_HW_HALOW_MORSE_MICRO_BUSY                   (pyb_pin_P11)
+#define MICROPY_HW_HALOW_MORSE_MICRO_BUSY_INVERTED          (1)             // shield inverts BUSY
+#define MICROPY_HW_HALOW_MORSE_MICRO_SET_MSPLIM             (1)             // mboot leaves MSPLIM set
+#endif
 
 // Bluetooth config
 #define MICROPY_HW_BLE_UART_ID                  (PYB_UART_2)
