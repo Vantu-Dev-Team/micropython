@@ -1,4 +1,5 @@
 # test handling of failed heap allocation with bytearray
+# requires: bytearray slice
 
 try:
     import micropython

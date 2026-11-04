@@ -157,6 +157,7 @@ endif
 SHARED_SRC_C += $(addprefix shared/,\
 	libc/string0.c \
 	netutils/dhcpserver.c \
+	netutils/get_mac_ascii.c \
 	netutils/trace.c \
 	readline/readline.c \
 	runtime/gchelper_native.c \
@@ -182,6 +183,18 @@ DRIVERS_SRC_C += $(addprefix drivers/,\
 -include $(TOP)/lib/tinyusb/src/tinyusb.mk
 TINYUSB_SRC_C := $(sort $(addprefix lib/tinyusb/, $(TINYUSB_SRC_C)))
 TINYUSB_SRC_C += tinyusb_port/tusb_alif_dcd.c
+
+# HaLow driver linkage (prebuilt morselib, transceiver firmware blobs), included
+# only by the core that has HaLow as it fetches the driver's nested submodule,
+# and the cores build in parallel.  Absent until the submodule is fetched,
+# which "make submodules" must still parse past.
+ifeq ($(MICROPY_PY_NETWORK_HALOW_MORSE_MICRO),1)
+-include $(TOP)/lib/mm-halow-driver/mm_halow.mk
+CFLAGS += $(MM_HALOW_CFLAGS)
+LIBS += $(MM_HALOW_LIBS)
+OBJ += $(MM_HALOW_OBJ)
+SRC_THIRDPARTY_C += $(MM_HALOW_SRC_C)
+endif
 
 ALIF_SRC_C += $(addprefix $(ALIF_DFP_REL_TOP)/,\
 	Device/common/source/clk.c \

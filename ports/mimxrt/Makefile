@@ -51,6 +51,13 @@ FROZEN_MANIFEST ?= boards/manifest.py
 include $(TOP)/py/py.mk
 include $(TOP)/extmod/extmod.mk
 
+# HaLow driver linkage (prebuilt morselib, transceiver firmware blobs), included
+# only when HaLow is enabled as it fetches the driver's nested submodule.  Absent
+# until the submodule is fetched, which "make submodules" must still parse past.
+ifeq ($(MICROPY_PY_NETWORK_HALOW_MORSE_MICRO),1)
+-include $(TOP)/lib/mm-halow-driver/mm_halow.mk
+endif
+
 # Set SDK directory based on MCU_SERIES
 MCUX_SDK_DIR = lib/nxp_driver/sdk
 MCU_DIR = $(MCUX_SDK_DIR)/devices/$(MCU_SERIES)
@@ -285,6 +292,7 @@ SHARED_SRC_C += \
 	shared/libc/printf.c \
 	shared/libc/string0.c \
 	shared/netutils/dhcpserver.c \
+	shared/netutils/get_mac_ascii.c \
 	shared/netutils/netutils.c \
 	shared/netutils/trace.c \
 	shared/readline/readline.c \
@@ -477,10 +485,14 @@ else
 endif
 
 
-# All settings for Ethernet support are controller by the value of MICROPY_PY_LWIP
+# All settings for Ethernet support are controller by the value of MICROPY_PY_LWIP.
+# A KSZ8081RNA has to be switched to 50MHz RMII clock mode.  A KSZ8081RND is in
+# that mode by default, and the same register bit selects 25MHz mode instead.
 ifeq ($(MICROPY_PY_LWIP),1)
+ifneq ($(MICROPY_PY_NETWORK_PHYKSZ8081RND),1)
 CFLAGS += \
 	-DFSL_FEATURE_PHYKSZ8081_USE_RMII50M_MODE=1
+endif
 endif
 
 ifdef MICROPY_HW_FLASH_CLK
@@ -532,6 +544,16 @@ endif
 # =============================================================================
 
 LIBS = $(shell $(CC) $(CFLAGS) -print-libgcc-file-name)
+
+ifeq ($(MICROPY_PY_NETWORK_HALOW_MORSE_MICRO),1)
+CFLAGS += $(MM_HALOW_CFLAGS)
+# This port links with $(LD) rather than $(CC), so the driver's link group
+# goes in without the compiler driver's -Wl, prefix.
+COMMA := ,
+LIBS += $(subst -Wl$(COMMA),,$(MM_HALOW_LIBS))
+OBJ += $(MM_HALOW_OBJ)
+SRC_THIRDPARTY_C += $(MM_HALOW_SRC_C)
+endif
 
 OBJ += $(PY_O)
 OBJ += $(addprefix $(BUILD)/, $(LIBM_SRC_C:.c=.o))
