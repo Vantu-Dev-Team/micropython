@@ -272,6 +272,9 @@ static mp_int_t mp_machine_reset_cause(void) {
 #endif
 
 MP_NORETURN void machine_bootloader_rtc(void) {
+    #ifdef MICROPY_BOARD_PRE_RESET
+    MICROPY_BOARD_PRE_RESET();
+    #endif
     #if CONFIG_IDF_TARGET_ESP32S3 && MICROPY_HW_USB_CDC
     usb_usj_mode();
     usb_dc_prepare_persist();
@@ -341,6 +344,9 @@ static mp_obj_t machine_wake_pins(void) {
 static MP_DEFINE_CONST_FUN_OBJ_0(machine_wake_pins_obj, machine_wake_pins);
 
 MP_NORETURN static void mp_machine_reset(void) {
+    #ifdef MICROPY_BOARD_PRE_RESET
+    MICROPY_BOARD_PRE_RESET();
+    #endif
     esp_restart();
 }
 

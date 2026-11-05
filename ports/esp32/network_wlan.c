@@ -375,8 +375,9 @@ static mp_obj_t network_wlan_connect(size_t n_args, const mp_obj_t *pos_args, mp
     wifi_sta_reconnects = 0;
     // connect to the WiFi AP
     MP_THREAD_GIL_EXIT();
-    esp_exceptions(esp_wifi_connect());
+    esp_err_t connect_error = esp_wifi_connect();
     MP_THREAD_GIL_ENTER();
+    esp_exceptions(connect_error);
     wifi_sta_connect_requested = true;
 
     return mp_const_none;
@@ -493,7 +494,11 @@ static mp_obj_t network_wlan_scan(mp_obj_t self_in) {
     MP_THREAD_GIL_ENTER();
     if (status == 0) {
         uint16_t count = 0;
-        esp_exceptions(esp_wifi_scan_get_ap_num(&count));
+        esp_err_t error = esp_wifi_scan_get_ap_num(&count);
+        if (error != ESP_OK) {
+            esp_wifi_clear_ap_list();
+            esp_exceptions(error);
+        }
         if (count == 0) {
             // esp_wifi_scan_get_ap_records must be called to free internal buffers from the scan.
             // But it returns an error if wifi_ap_records==NULL.  So allocate at least 1 AP entry.
@@ -501,18 +506,34 @@ static mp_obj_t network_wlan_scan(mp_obj_t self_in) {
             count = 1;
         }
         wifi_ap_record_t *wifi_ap_records = calloc(count, sizeof(wifi_ap_record_t));
-        esp_exceptions(esp_wifi_scan_get_ap_records(&count, wifi_ap_records));
-        for (uint16_t i = 0; i < count; i++) {
-            mp_obj_tuple_t *t = mp_obj_new_tuple(6, NULL);
-            uint8_t *x = memchr(wifi_ap_records[i].ssid, 0, sizeof(wifi_ap_records[i].ssid));
-            int ssid_len = x ? x - wifi_ap_records[i].ssid : sizeof(wifi_ap_records[i].ssid);
-            t->items[0] = mp_obj_new_bytes(wifi_ap_records[i].ssid, ssid_len);
-            t->items[1] = mp_obj_new_bytes(wifi_ap_records[i].bssid, sizeof(wifi_ap_records[i].bssid));
-            t->items[2] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].primary);
-            t->items[3] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].rssi);
-            t->items[4] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].authmode);
-            t->items[5] = mp_const_false; // XXX hidden?
-            mp_obj_list_append(list, MP_OBJ_FROM_PTR(t));
+        if (wifi_ap_records == NULL) {
+            esp_wifi_clear_ap_list();
+            mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("WiFi scan allocation failed"));
+        }
+        error = esp_wifi_scan_get_ap_records(&count, wifi_ap_records);
+        if (error != ESP_OK) {
+            free(wifi_ap_records);
+            esp_wifi_clear_ap_list();
+            esp_exceptions(error);
+        }
+        nlr_buf_t nlr;
+        if (nlr_push(&nlr) == 0) {
+            for (uint16_t i = 0; i < count; i++) {
+                mp_obj_tuple_t *t = mp_obj_new_tuple(6, NULL);
+                uint8_t *x = memchr(wifi_ap_records[i].ssid, 0, sizeof(wifi_ap_records[i].ssid));
+                int ssid_len = x ? x - wifi_ap_records[i].ssid : sizeof(wifi_ap_records[i].ssid);
+                t->items[0] = mp_obj_new_bytes(wifi_ap_records[i].ssid, ssid_len);
+                t->items[1] = mp_obj_new_bytes(wifi_ap_records[i].bssid, sizeof(wifi_ap_records[i].bssid));
+                t->items[2] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].primary);
+                t->items[3] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].rssi);
+                t->items[4] = MP_OBJ_NEW_SMALL_INT(wifi_ap_records[i].authmode);
+                t->items[5] = mp_const_false; // XXX hidden?
+                mp_obj_list_append(list, MP_OBJ_FROM_PTR(t));
+            }
+            nlr_pop();
+        } else {
+            free(wifi_ap_records);
+            nlr_jump(nlr.ret_val);
         }
         free(wifi_ap_records);
     }

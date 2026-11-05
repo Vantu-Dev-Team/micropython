@@ -34,6 +34,7 @@
 #include "mpthreadport.h"
 
 #include "esp_task.h"
+#include "esp_system.h"
 
 #if MICROPY_PY_THREAD
 
@@ -58,6 +59,7 @@ typedef struct _mp_thread_t {
     void *stack;            // pointer to the stack
     size_t stack_len;       // number of words in the stack
     struct _mp_thread_t *next;
+    bool native_inflight;
 } mp_thread_t;
 
 // the mutex controls access to the linked list
@@ -74,6 +76,7 @@ void mp_thread_init(void *stack, uint32_t stack_len) {
     thread_entry0.stack = stack;
     thread_entry0.stack_len = stack_len;
     thread_entry0.next = NULL;
+    thread_entry0.native_inflight = false;
     thread = &thread_entry0;
     mp_thread_mutex_init(&thread_mutex);
 
@@ -165,6 +168,7 @@ mp_uint_t mp_thread_create_ex(void *(*entry)(void *), void *arg, size_t *stack_s
 
     // add thread to linked list of all threads
     th->run_state = MP_THREAD_RUN_STATE_NEW;
+    th->native_inflight = false;
     th->arg = arg;
     th->stack = pxTaskGetStackStart(th->id);
     th->stack_len = *stack_size / sizeof(uintptr_t);
@@ -198,11 +202,41 @@ void mp_thread_mutex_init(mp_thread_mutex_t *mutex) {
     xSemaphoreGive(mutex->handle);
 }
 
+// No Python/GC work while a worker is outside the GIL. Before teardown,
+// let such calls return so native drivers cannot retain its freed stack.
+static void thread_native_state(bool active) {
+    xSemaphoreTake(thread_mutex.handle, portMAX_DELAY);
+    TaskHandle_t current = xTaskGetCurrentTaskHandle();
+    for (mp_thread_t *th = thread; th != NULL; th = th->next) {
+        if (th->id == current) {
+            th->native_inflight = active;
+            break;
+        }
+    }
+    xSemaphoreGive(thread_mutex.handle);
+}
+
+void mp_thread_safe_lock_wait(void) {
+    // A Python lock wait is a FreeRTOS semaphore wait, with no external
+    // driver retaining the task's stack. vTaskDelete may cancel it safely.
+    thread_native_state(false);
+}
+
 int mp_thread_mutex_lock(mp_thread_mutex_t *mutex, int wait) {
+    #if MICROPY_HW_SAFE_THREAD_TEARDOWN
+    if (mutex == &MP_STATE_VM(gil_mutex)) {
+        thread_native_state(false);
+    }
+    #endif
     return pdTRUE == xSemaphoreTake(mutex->handle, wait ? portMAX_DELAY : 0);
 }
 
 void mp_thread_mutex_unlock(mp_thread_mutex_t *mutex) {
+    #if MICROPY_HW_SAFE_THREAD_TEARDOWN
+    if (mutex == &MP_STATE_VM(gil_mutex)) {
+        thread_native_state(true);
+    }
+    #endif
     xSemaphoreGive(mutex->handle);
     // Python threads run at equal priority, so preemptively yield here to
     // prevent pathological imbalances where a thread unlocks and then
@@ -215,6 +249,32 @@ void mp_thread_deinit(void) {
     // The current task should be thread_entry0 and should be the last in the linked list.
     assert(thread_entry0.id == xTaskGetCurrentTaskHandle());
     assert(thread_entry0.next == NULL);
+
+    #if MICROPY_HW_SAFE_THREAD_TEARDOWN
+    // Main retains the GIL. Returning workers clear native_inflight before
+    // waiting for it, so no user code can start another native operation.
+    TickType_t start = xTaskGetTickCount();
+    for (;;) {
+        bool active = false;
+        mp_thread_mutex_lock(&thread_mutex, 1);
+        for (mp_thread_t *th = thread; th != NULL; th = th->next) {
+            active |= th != &thread_entry0 && th->run_state != MP_THREAD_RUN_STATE_FINISHED
+                && th->native_inflight;
+        }
+        mp_thread_mutex_unlock(&thread_mutex);
+        if (!active) {
+            break;
+        }
+        if (xTaskGetTickCount() - start >= pdMS_TO_TICKS(2000)) {
+            printf("Sento: full reset; worker still in native I/O\n");
+            #ifdef MICROPY_BOARD_PRE_RESET
+            MICROPY_BOARD_PRE_RESET();
+            #endif
+            esp_restart();
+        }
+        vTaskDelay(1);
+    }
+    #endif
 
     // Delete all tasks except the main one.
     mp_thread_mutex_lock(&thread_mutex, 1);

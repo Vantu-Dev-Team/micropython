@@ -67,6 +67,9 @@ static mp_obj_t thread_lock_acquire(size_t n_args, const mp_obj_t *args) {
         // TODO support timeout arg
     }
     MP_THREAD_GIL_EXIT();
+    #ifdef MICROPY_THREAD_LOCK_WAIT
+    MICROPY_THREAD_LOCK_WAIT();
+    #endif
     int ret = mp_thread_mutex_lock(&self->mutex, wait);
     MP_THREAD_GIL_ENTER();
     if (ret == 0) {
