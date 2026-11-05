@@ -37,7 +37,10 @@
 
 #if MICROPY_PY_THREAD
 
-#define MP_THREAD_MIN_STACK_SIZE                        (4 * 1024)
+#ifndef MICROPY_HW_THREAD_MIN_STACK_SIZE
+#define MICROPY_HW_THREAD_MIN_STACK_SIZE                 (4 * 1024)
+#endif
+#define MP_THREAD_MIN_STACK_SIZE                        MICROPY_HW_THREAD_MIN_STACK_SIZE
 #define MP_THREAD_DEFAULT_STACK_SIZE                    (MP_THREAD_MIN_STACK_SIZE + MICROPY_STACK_CHECK_MARGIN)
 #define MP_THREAD_PRIORITY                              (ESP_TASK_PRIO_MIN + 1)
 

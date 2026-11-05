@@ -388,3 +388,15 @@ Troubleshooting
 * Continuous reboots after programming: Ensure `CONFIG_ESPTOOLPY_FLASHMODE` is
   correct for your board (e.g. ESP-WROOM-32 should be DIO). Then perform a
   `make clean`, rebuild, redeploy.
+
+
+Thread stack configuration
+--------------------------
+
+A board may define `MICROPY_HW_THREAD_MIN_STACK_SIZE` in bytes. The ESP32
+port clamps explicit thread-stack requests to this allocation floor; the
+default allocation adds `MICROPY_STACK_CHECK_MARGIN` to the floor. The
+checked C-stack limit still subtracts that margin. Boards which do not set
+the option retain the 4 KiB floor. With the GIL enabled, scheduled Python
+callbacks may run on any Python thread; board authors should account for
+their callback and native-driver stack use when choosing a floor.
