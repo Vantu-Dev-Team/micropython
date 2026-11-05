@@ -567,8 +567,15 @@ static void mp_machine_uart_sendbreak(machine_uart_obj_t *self) {
 static void uart_irq_configure_timer(machine_uart_obj_t *self, mp_uint_t trigger) {
 
     self->rxidle_state = RXIDLE_INACTIVE;
+    if (self->rxidle_timer != NULL) {
+        machine_timer_stop(self->rxidle_timer);
+    }
 
     if (trigger & UART_IRQ_RXIDLE) {
+        // irq.trigger() may be called before a handler has created a timer.
+        if (self->rxidle_timer == NULL) {
+            self->rxidle_timer = machine_timer_create(RXIDLE_TIMER_IDX);
+        }
         // The RXIDLE event is always a soft IRQ.
         self->mp_irq_obj->ishard = false;
         uint32_t baudrate;
