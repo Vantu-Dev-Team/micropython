@@ -567,8 +567,15 @@ static void mp_machine_uart_sendbreak(machine_uart_obj_t *self) {
 static void uart_irq_configure_timer(machine_uart_obj_t *self, mp_uint_t trigger) {
 
     self->rxidle_state = RXIDLE_INACTIVE;
+    if (self->rxidle_timer != NULL) {
+        machine_timer_stop(self->rxidle_timer);
+    }
 
     if (trigger & UART_IRQ_RXIDLE) {
+        // irq.trigger() may be called before a handler has created a timer.
+        if (self->rxidle_timer == NULL) {
+            self->rxidle_timer = machine_timer_create(RXIDLE_TIMER_IDX);
+        }
         // The RXIDLE event is always a soft IRQ.
         self->mp_irq_obj->ishard = false;
         uint32_t baudrate;
@@ -635,12 +642,19 @@ static mp_irq_obj_t *mp_machine_uart_irq(machine_uart_obj_t *self, bool any_args
             mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("trigger 0x%04x unsupported"), not_supported);
         }
 
-        self->mp_irq_obj->handler = handler;
         if (args[MP_IRQ_ARG_INIT_hard].u_bool) {
             mp_raise_ValueError(MP_ERROR_TEXT("hard IRQ is not supported"));
         }
+        self->mp_irq_obj->handler = handler;
         self->mp_irq_obj->ishard = false;
         self->mp_irq_trigger = trigger;
+
+        // The event task can start the RXIDLE timer. Stop its producer before
+        // deinitializing the timer and dropping the last reference to it.
+        if (handler == mp_const_none && self->uart_event_task != NULL) {
+            vTaskDelete(self->uart_event_task);
+            self->uart_event_task = NULL;
+        }
 
         // Set up the RXIDLE timer
         if (handler != mp_const_none) {
@@ -656,9 +670,6 @@ static mp_irq_obj_t *mp_machine_uart_irq(machine_uart_obj_t *self, bool any_args
         // Start a task for handling events
         if (handler != mp_const_none && self->uart_event_task == NULL && self->uart_queue != NULL) {
             uart_event_task_create(self);
-        } else if (handler == mp_const_none && self->uart_event_task != NULL) {
-            vTaskDelete(self->uart_event_task);
-            self->uart_event_task = NULL;
         }
     }
 
