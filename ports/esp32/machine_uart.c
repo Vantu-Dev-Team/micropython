@@ -41,6 +41,7 @@
 #include "uart.h"
 #include "machine_uart.h"
 #include "machine_timer.h"
+#include <stdatomic.h>
 
 #if SOC_UART_SUPPORT_XTAL_CLK
 // Works independently of APB frequency, on ESP32C3, ESP32S3.
@@ -120,6 +121,7 @@ typedef struct _machine_uart_obj_t {
     mp_irq_obj_t *mp_irq_obj;  // user IRQ object
     machine_timer_obj_t *rxidle_timer;
     uint8_t rxidle_state;
+    atomic_uint active_readers;
 } machine_uart_obj_t;
 
 static const char *_parity_name[] = {"None", "1", "0"};
@@ -258,6 +260,9 @@ static void mp_machine_uart_print(const mp_print_t *print, mp_obj_t self_in, mp_
 }
 
 static void mp_machine_uart_init_helper(machine_uart_obj_t *self, size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    if (atomic_load(&self->active_readers)) {
+        mp_raise_OSError(MP_EBUSY);
+    }
     enum { ARG_baudrate, ARG_bits, ARG_parity, ARG_stop, ARG_tx, ARG_rx, ARG_rts, ARG_cts, ARG_txbuf, ARG_rxbuf, ARG_timeout, ARG_timeout_char, ARG_invert, ARG_flow };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_baudrate, MP_ARG_INT, {.u_int = 0} },
@@ -487,6 +492,7 @@ static mp_obj_t mp_machine_uart_make_new(const mp_obj_type_t *type, size_t n_arg
     if (self == NULL) {
         // Allocate a new UART object
         self = mp_obj_malloc(machine_uart_obj_t, &machine_uart_type);
+        atomic_init(&self->active_readers, 0);
         self->uart_num = uart_num;
         // remaining fields are set from inside mp_machine_uart_init_helper()
     }
@@ -504,6 +510,9 @@ static mp_obj_t mp_machine_uart_make_new(const mp_obj_type_t *type, size_t n_arg
 }
 
 static void mp_machine_uart_deinit(machine_uart_obj_t *self) {
+    if (atomic_load(&self->active_readers)) {
+        mp_raise_OSError(MP_EBUSY);
+    }
     if (self->uart_event_task != NULL) {
         vTaskDelete(self->uart_event_task);
         self->uart_event_task = NULL;
@@ -687,16 +696,23 @@ static mp_uint_t mp_machine_uart_read(mp_obj_t self_in, void *buf_in, mp_uint_t 
     TickType_t time_to_wait = self->timeout > 0 ? pdMS_TO_TICKS(self->timeout) : 0;
 
     bool release_gil = (self->timeout + self->timeout_char) > 0;
+    atomic_fetch_add(&self->active_readers, 1);
     if (release_gil) {
         MP_THREAD_GIL_EXIT();
     }
 
     int bytes_read = uart_read_bytes(self->uart_num, buf_in, 1, time_to_wait);
-    if (size > 1 && bytes_read != 0) {
+    if (size > 1 && bytes_read > 0) {
         time_to_wait = self->timeout_char > 0 ? pdMS_TO_TICKS(self->timeout_char) : 0;
-        bytes_read += uart_read_bytes(self->uart_num, buf_in + 1, size - 1, time_to_wait);
+        int more = uart_read_bytes(self->uart_num, buf_in + 1, size - 1, time_to_wait);
+        if (more > 0) {
+            bytes_read += more;
+        }
     }
 
+    // Publish completion before reacquiring the GIL: soft-reset teardown
+    // may retire this worker while it is waiting to re-enter Python.
+    atomic_fetch_sub(&self->active_readers, 1);
     if (release_gil) {
         MP_THREAD_GIL_ENTER();
     }

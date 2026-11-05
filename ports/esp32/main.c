@@ -150,12 +150,34 @@ soft_reset:
     machine_i2s_init0();
     #endif
 
-    // Run optional frozen boot code.
-    #ifdef MICROPY_BOARD_FROZEN_BOOT_FILE
-    pyexec_frozen_module(MICROPY_BOARD_FROZEN_BOOT_FILE, false);
+    #ifdef MICROPY_BOARD_VM_START
+    MICROPY_BOARD_VM_START();
     #endif
 
-    int ret = pyexec_file_if_exists("boot.py");
+    // Run optional frozen boot code.
+    #ifdef MICROPY_BOARD_FROZEN_BOOT_FILE
+    int frozen_ret = pyexec_frozen_module(MICROPY_BOARD_FROZEN_BOOT_FILE, false);
+    #ifdef MICROPY_BOARD_USER_CODE_RESULT
+    if (MICROPY_BOARD_USER_CODE_RESULT(0, frozen_ret)) {
+        goto soft_reset_exit;
+    }
+    #else
+    (void)frozen_ret;
+    #endif
+    #endif
+
+    int ret = PYEXEC_NORMAL_EXIT;
+    #ifdef MICROPY_BOARD_BEFORE_USER_CODE
+    if (MICROPY_BOARD_BEFORE_USER_CODE(1))
+    #endif
+    {
+        ret = pyexec_file_if_exists("boot.py");
+        #ifdef MICROPY_BOARD_USER_CODE_RESULT
+        if (MICROPY_BOARD_USER_CODE_RESULT(1, ret)) {
+            goto soft_reset_exit;
+        }
+        #endif
+    }
 
     #if MICROPY_HW_ENABLE_USBDEV
     mp_usbd_init();
@@ -165,11 +187,25 @@ soft_reset:
         goto soft_reset_exit;
     }
     if (pyexec_mode_kind == PYEXEC_MODE_FRIENDLY_REPL && ret != 0) {
-        int ret = pyexec_file_if_exists("main.py");
-        if (ret & PYEXEC_FORCED_EXIT) {
-            goto soft_reset_exit;
+        #ifdef MICROPY_BOARD_BEFORE_USER_CODE
+        if (MICROPY_BOARD_BEFORE_USER_CODE(2))
+        #endif
+        {
+            int ret = pyexec_file_if_exists("main.py");
+            #ifdef MICROPY_BOARD_USER_CODE_RESULT
+            if (MICROPY_BOARD_USER_CODE_RESULT(2, ret)) {
+                goto soft_reset_exit;
+            }
+            #endif
+            if (ret & PYEXEC_FORCED_EXIT) {
+                goto soft_reset_exit;
+            }
         }
     }
+
+    #ifdef MICROPY_BOARD_REPL_ENTER
+    MICROPY_BOARD_REPL_ENTER();
+    #endif
 
     for (;;) {
         if (pyexec_mode_kind == PYEXEC_MODE_RAW_REPL) {
@@ -186,6 +222,11 @@ soft_reset:
     }
 
 soft_reset_exit:
+
+    #if MICROPY_PY_THREAD && MICROPY_HW_SAFE_THREAD_TEARDOWN
+    // Drain native calls before deleting workers or freeing their drivers.
+    mp_thread_deinit();
+    #endif
 
     #if MICROPY_BLUETOOTH_NIMBLE
     mp_bluetooth_deinit();
@@ -208,7 +249,7 @@ soft_reset_exit:
     esp32_pcnt_deinit_all();
     #endif
 
-    #if MICROPY_PY_THREAD
+    #if MICROPY_PY_THREAD && !MICROPY_HW_SAFE_THREAD_TEARDOWN
     mp_thread_deinit();
     #endif
 
