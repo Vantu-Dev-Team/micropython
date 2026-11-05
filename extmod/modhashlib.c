@@ -77,7 +77,7 @@ static mp_obj_t hashlib_sha256_update(mp_obj_t self_in, mp_obj_t arg);
 
 static mp_obj_t hashlib_sha256_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args) {
     mp_arg_check_num(n_args, n_kw, 0, 1, false);
-    mp_obj_hash_t *o = mp_obj_malloc_var(mp_obj_hash_t, state, char, sizeof(mbedtls_sha256_context), type);
+    mp_obj_hash_t *o = mp_obj_malloc_var_with_finaliser(mp_obj_hash_t, state, char, sizeof(mbedtls_sha256_context), type);
     o->final = false;
     mbedtls_sha256_init((mbedtls_sha256_context *)&o->state);
     mbedtls_sha256_starts((mbedtls_sha256_context *)&o->state, 0);
@@ -100,11 +100,20 @@ static mp_obj_t hashlib_sha256_digest(mp_obj_t self_in) {
     mp_obj_hash_t *self = MP_OBJ_TO_PTR(self_in);
     hashlib_ensure_not_final(self);
     self->final = true;
-    vstr_t vstr;
-    vstr_init_len(&vstr, 32);
-    mbedtls_sha256_finish((mbedtls_sha256_context *)&self->state, (unsigned char *)vstr.buf);
-    return mp_obj_new_bytes_from_vstr(&vstr);
+    byte digest[32];
+    mbedtls_sha256_finish((mbedtls_sha256_context *)&self->state, digest);
+    mbedtls_sha256_free((mbedtls_sha256_context *)&self->state);
+    return mp_obj_new_bytes(digest, sizeof(digest));
 }
+
+static mp_obj_t hashlib_sha256_del(mp_obj_t self_in) {
+    mp_obj_hash_t *self = MP_OBJ_TO_PTR(self_in);
+    self->final = true;
+    // Also safe after digest(), failed allocation or an earlier finalizer.
+    mbedtls_sha256_free((mbedtls_sha256_context *)&self->state);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(hashlib_sha256_del_obj, hashlib_sha256_del);
 
 #else
 
@@ -147,6 +156,9 @@ static MP_DEFINE_CONST_FUN_OBJ_1(hashlib_sha256_digest_obj, hashlib_sha256_diges
 static const mp_rom_map_elem_t hashlib_sha256_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_update), MP_ROM_PTR(&hashlib_sha256_update_obj) },
     { MP_ROM_QSTR(MP_QSTR_digest), MP_ROM_PTR(&hashlib_sha256_digest_obj) },
+    #if MICROPY_SSL_MBEDTLS
+    { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&hashlib_sha256_del_obj) },
+    #endif
 };
 
 static MP_DEFINE_CONST_DICT(hashlib_sha256_locals_dict, hashlib_sha256_locals_dict_table);
@@ -199,7 +211,7 @@ static mp_obj_t hashlib_sha1_digest(mp_obj_t self_in) {
 
 static mp_obj_t hashlib_sha1_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args) {
     mp_arg_check_num(n_args, n_kw, 0, 1, false);
-    mp_obj_hash_t *o = mp_obj_malloc_var(mp_obj_hash_t, state, char, sizeof(mbedtls_sha1_context), type);
+    mp_obj_hash_t *o = mp_obj_malloc_var_with_finaliser(mp_obj_hash_t, state, char, sizeof(mbedtls_sha1_context), type);
     o->final = false;
     mbedtls_sha1_init((mbedtls_sha1_context *)o->state);
     mbedtls_sha1_starts((mbedtls_sha1_context *)o->state);
@@ -222,12 +234,19 @@ static mp_obj_t hashlib_sha1_digest(mp_obj_t self_in) {
     mp_obj_hash_t *self = MP_OBJ_TO_PTR(self_in);
     hashlib_ensure_not_final(self);
     self->final = true;
-    vstr_t vstr;
-    vstr_init_len(&vstr, 20);
-    mbedtls_sha1_finish((mbedtls_sha1_context *)self->state, (byte *)vstr.buf);
+    byte digest[20];
+    mbedtls_sha1_finish((mbedtls_sha1_context *)self->state, digest);
     mbedtls_sha1_free((mbedtls_sha1_context *)self->state);
-    return mp_obj_new_bytes_from_vstr(&vstr);
+    return mp_obj_new_bytes(digest, sizeof(digest));
 }
+
+static mp_obj_t hashlib_sha1_del(mp_obj_t self_in) {
+    mp_obj_hash_t *self = MP_OBJ_TO_PTR(self_in);
+    self->final = true;
+    mbedtls_sha1_free((mbedtls_sha1_context *)self->state);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(hashlib_sha1_del_obj, hashlib_sha1_del);
 #endif
 
 static MP_DEFINE_CONST_FUN_OBJ_2(hashlib_sha1_update_obj, hashlib_sha1_update);
@@ -236,6 +255,9 @@ static MP_DEFINE_CONST_FUN_OBJ_1(hashlib_sha1_digest_obj, hashlib_sha1_digest);
 static const mp_rom_map_elem_t hashlib_sha1_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_update), MP_ROM_PTR(&hashlib_sha1_update_obj) },
     { MP_ROM_QSTR(MP_QSTR_digest), MP_ROM_PTR(&hashlib_sha1_digest_obj) },
+    #if MICROPY_SSL_MBEDTLS
+    { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&hashlib_sha1_del_obj) },
+    #endif
 };
 static MP_DEFINE_CONST_DICT(hashlib_sha1_locals_dict, hashlib_sha1_locals_dict_table);
 
