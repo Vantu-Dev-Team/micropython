@@ -635,10 +635,10 @@ static mp_irq_obj_t *mp_machine_uart_irq(machine_uart_obj_t *self, bool any_args
             mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("trigger 0x%04x unsupported"), not_supported);
         }
 
-        self->mp_irq_obj->handler = handler;
         if (args[MP_IRQ_ARG_INIT_hard].u_bool) {
             mp_raise_ValueError(MP_ERROR_TEXT("hard IRQ is not supported"));
         }
+        self->mp_irq_obj->handler = handler;
         self->mp_irq_obj->ishard = false;
         self->mp_irq_trigger = trigger;
 
