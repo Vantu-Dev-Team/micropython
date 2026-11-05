@@ -37,6 +37,7 @@
 
 #include "machine_timer.h"
 #include "esp_clk_tree.h"
+#include "freertos/semphr.h"
 
 #if !MICROPY_ENABLE_FINALISER
 #error "machine.Timer requires MICROPY_ENABLE_FINALISER."
@@ -46,6 +47,21 @@
 #define TIMER_DIVIDER  8
 
 const mp_obj_type_t machine_timer_type;
+
+static esp_timer_handle_t machine_timer_barrier;
+static StaticSemaphore_t machine_timer_barrier_storage;
+static SemaphoreHandle_t machine_timer_barrier_done;
+
+static void machine_timer_barrier_callback(void *arg) {
+    xSemaphoreGive(machine_timer_barrier_done);
+}
+
+static void machine_timer_sync_virtual(void) {
+    // ESP_TIMER_TASK callbacks are serial. A barrier after stop() drains an
+    // already dispatched callback before its GC-managed argument is freed.
+    check_esp_err(esp_timer_start_once(machine_timer_barrier, 1));
+    xSemaphoreTake(machine_timer_barrier_done, portMAX_DELAY);
+}
 
 uint32_t machine_timer_freq_hz(machine_timer_obj_t *self) {
     if (self->id >= 0) {
@@ -62,17 +78,28 @@ uint32_t machine_timer_freq_hz(machine_timer_obj_t *self) {
 
 static bool machine_timer_isr_hardware(gptimer_handle_t timer, const gptimer_alarm_event_data_t *event_data, void *self_in) {
     machine_timer_obj_t *self = self_in;
-    return self->handler(self);
+    mp_uint_t atomic_state = MICROPY_BEGIN_ATOMIC_SECTION();
+    bool wake = self->handler != NULL && self->handler(self);
+    MICROPY_END_ATOMIC_SECTION(atomic_state);
+    return wake;
 }
 
 static void machine_timer_isr_virtual(void *self_in) {
     machine_timer_obj_t *self = self_in;
-    if (self->repeat) {
-        self->virtual_started = esp_timer_get_time();
-    } else {
-        self->virtual_stopped = esp_timer_get_time();
+    // stop() may race an already dispatched callback on the other core.
+    // Keep the handler and its context live together until it returns.
+    mp_uint_t atomic_state = MICROPY_BEGIN_ATOMIC_SECTION();
+    bool wake = false;
+    if (self->handler != NULL) {
+        if (self->repeat) {
+            self->virtual_started = esp_timer_get_time();
+        } else {
+            self->virtual_stopped = esp_timer_get_time();
+        }
+        wake = self->handler(self);
     }
-    if (self->handler(self)) {
+    MICROPY_END_ATOMIC_SECTION(atomic_state);
+    if (wake) {
         #if CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD
         esp_timer_isr_dispatch_need_yield();
         #endif
@@ -110,6 +137,16 @@ machine_timer_obj_t *machine_timer_create(mp_int_t id) {
     // regardless of the order in which timer IDs are created and deleted in Python.
     if (id > 0) {
         machine_timer_create(id - 1);
+    }
+
+    if (id < 0 && machine_timer_barrier == NULL) {
+        machine_timer_barrier_done = xSemaphoreCreateBinaryStatic(&machine_timer_barrier_storage);
+        const esp_timer_create_args_t barrier_args = {
+            .callback = machine_timer_barrier_callback,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "mpy_timer_barrier",
+        };
+        check_esp_err(esp_timer_create(&barrier_args, &machine_timer_barrier));
     }
 
     machine_timer_obj_t *self = mp_obj_malloc_with_finaliser(machine_timer_obj_t, &machine_timer_type);
@@ -235,12 +272,14 @@ mp_obj_t machine_timer_deinit(mp_obj_t self_in) {
             }
         }
     }
+    mp_uint_t atomic_state = MICROPY_BEGIN_ATOMIC_SECTION();
     self->period = 0;
     self->repeat = false;
     self->virtual_started = 0;
     self->virtual_stopped = 0;
     self->handler = NULL;
     self->handler_ctx = NULL;
+    MICROPY_END_ATOMIC_SECTION(atomic_state);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(machine_timer_deinit_obj, machine_timer_deinit);
@@ -295,8 +334,10 @@ static mp_obj_t machine_timer_init_helper(machine_timer_obj_t *self, mp_uint_t n
 
     self->repeat = args[ARG_mode].u_int;
 
+    mp_uint_t atomic_state = MICROPY_BEGIN_ATOMIC_SECTION();
     self->handler = machine_timer_handler;
     self->handler_ctx = args[ARG_callback].u_obj;
+    MICROPY_END_ATOMIC_SECTION(atomic_state);
 
     machine_timer_configure(self);
     machine_timer_start(self);
@@ -345,6 +386,7 @@ static mp_obj_t machine_timer_del(mp_obj_t self_in) {
         }
         check_esp_err(gptimer_del_timer(self->handle.hardware));
     } else {
+        machine_timer_sync_virtual();
         check_esp_err(esp_timer_delete(self->handle.virtual));
     }
 
