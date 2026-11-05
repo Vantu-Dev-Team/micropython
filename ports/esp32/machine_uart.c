@@ -642,6 +642,13 @@ static mp_irq_obj_t *mp_machine_uart_irq(machine_uart_obj_t *self, bool any_args
         self->mp_irq_obj->ishard = false;
         self->mp_irq_trigger = trigger;
 
+        // The event task can start the RXIDLE timer. Stop its producer before
+        // deinitializing the timer and dropping the last reference to it.
+        if (handler == mp_const_none && self->uart_event_task != NULL) {
+            vTaskDelete(self->uart_event_task);
+            self->uart_event_task = NULL;
+        }
+
         // Set up the RXIDLE timer
         if (handler != mp_const_none) {
             if (self->rxidle_timer == NULL) {
@@ -656,9 +663,6 @@ static mp_irq_obj_t *mp_machine_uart_irq(machine_uart_obj_t *self, bool any_args
         // Start a task for handling events
         if (handler != mp_const_none && self->uart_event_task == NULL && self->uart_queue != NULL) {
             uart_event_task_create(self);
-        } else if (handler == mp_const_none && self->uart_event_task != NULL) {
-            vTaskDelete(self->uart_event_task);
-            self->uart_event_task = NULL;
         }
     }
 
