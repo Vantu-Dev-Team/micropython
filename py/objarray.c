@@ -30,6 +30,7 @@
 #include <stdint.h>
 
 #include "py/runtime.h"
+#include "py/gc.h"
 #include "py/binary.h"
 #include "py/objstr.h"
 #include "py/objarray.h"
@@ -241,6 +242,20 @@ static mp_obj_t memoryview_make_new(const mp_obj_type_t *type_in, size_t n_args,
         self->memview_offset = other->memview_offset;
         self->items = other->items;
     }
+    #if MICROPY_ENABLE_GC
+    else {
+        // A buffer inside a heap object (e.g. bluetooth.UUID data) is only
+        // kept alive through the start of its allocation: point items there
+        // and reach the data through the offset.
+        byte *head = gc_ptr_head(bufinfo.buf);
+        size_t item_sz = mp_binary_get_size('@', bufinfo.typecode, NULL);
+        size_t delta = (byte *)bufinfo.buf - head;
+        if (head != NULL && delta != 0 && delta % item_sz == 0) {
+            self->items = head;
+            self->memview_offset = delta / item_sz;
+        }
+    }
+    #endif
 
     // test if the object can be written to
     if (mp_get_buffer(args[0], &bufinfo, MP_BUFFER_RW)) {
@@ -388,22 +403,52 @@ static mp_obj_t array_binary_op(mp_binary_op_t op, mp_obj_t lhs_in, mp_obj_t rhs
 }
 
 #if MICROPY_PY_BUILTINS_BYTEARRAY || MICROPY_PY_ARRAY
+// Grow an array's storage. The old block is never freed here: a memoryview
+// (or native code) may still point at it, and writing through such a stale
+// pointer after the block is reused would corrupt the heap. Growth happens in
+// place when possible; otherwise the contents move to a new block and the old
+// one is reclaimed by the GC once nothing references it. Storage the array
+// does not own (e.g. uctypes.bytearray_at) is copied the same way.
+static void *array_grow_items(void *items, size_t old_bytes, size_t new_bytes) {
+    mp_buffer_check_move(items, old_bytes);
+    void *grown = NULL;
+    #if MICROPY_ENABLE_GC
+    // Only reallocate a block this array provably owns whole: items is the
+    // start of a heap block sized exactly for the current capacity. A view
+    // borrowed from another object (uctypes.bytearray_at) fails this test.
+    size_t block_bytes = (old_bytes + MICROPY_BYTES_PER_GC_BLOCK - 1) / MICROPY_BYTES_PER_GC_BLOCK * MICROPY_BYTES_PER_GC_BLOCK;
+    if (items == NULL
+        || (old_bytes != 0 && gc_ptr_head(items) == items && gc_nbytes(items) == block_bytes)) {
+        grown = m_renew_maybe(byte, items, old_bytes, new_bytes, false);
+    }
+    #endif
+    if (grown == NULL) {
+        grown = m_new(byte, new_bytes);
+        memcpy(grown, items, old_bytes);
+    }
+    return grown;
+}
+
 static mp_obj_t array_append(mp_obj_t self_in, mp_obj_t arg) {
     // self is not a memoryview, so we don't need to use (& TYPECODE_MASK)
     assert((MICROPY_PY_BUILTINS_BYTEARRAY && mp_obj_is_type(self_in, &mp_type_bytearray))
         || (MICROPY_PY_ARRAY && mp_obj_is_type(self_in, &mp_type_array)));
     mp_obj_array_t *self = MP_OBJ_TO_PTR(self_in);
 
+    // Convert first: arg.__int__ may resize this array, so no capacity may be
+    // reserved (or items/len/free read) until the value is ready.
+    size_t item_sz = mp_binary_get_size('@', self->typecode, NULL);
+    uint64_t value[2];
+    assert(item_sz <= sizeof(value));
+    mp_binary_set_val_array(self->typecode, value, 0, arg);
     if (self->free == 0) {
-        size_t item_sz = mp_binary_get_size('@', self->typecode, NULL);
         // TODO: alloc policy
         size_t add_cnt = 8;
-        self->items = m_renew(byte, self->items, item_sz * self->len, item_sz * (self->len + add_cnt));
+        self->items = array_grow_items(self->items, item_sz * self->len, item_sz * (self->len + add_cnt));
         self->free = add_cnt;
         mp_seq_clear(self->items, self->len + 1, self->len + self->free, item_sz);
     }
-    mp_binary_set_val_array(self->typecode, self->items, self->len, arg);
-    // only update length/free if set succeeded
+    memcpy((byte *)self->items + self->len * item_sz, value, item_sz);
     self->len++;
     self->free--;
     return mp_const_none; // return None, as per CPython
@@ -431,7 +476,7 @@ static mp_obj_t array_extend(mp_obj_t self_in, mp_obj_t arg_in) {
     // make sure we have enough room to extend
     // TODO: alloc policy; at the moment we go conservative
     if (self->free < len) {
-        self->items = m_renew(byte, self->items, (self->len + self->free) * sz, (self->len + len) * sz);
+        self->items = array_grow_items(self->items, (self->len + self->free) * sz, (self->len + len) * sz);
         self->free = 0;
 
         if (self_in == arg_in) {
@@ -519,9 +564,9 @@ static mp_obj_t array_subscr(mp_obj_t self_in, mp_obj_t index_in, mp_obj_t value
                 if (len_adj > 0) {
                     if ((size_t)len_adj > o->free) {
                         // TODO: alloc policy; at the moment we go conservative
-                        o->items = m_renew(byte, o->items, (o->len + o->free) * item_sz, (o->len + len_adj) * item_sz);
+                        o->items = array_grow_items(o->items, (o->len + o->free) * item_sz, (o->len + len_adj) * item_sz);
                         o->free = len_adj;
-                        // m_renew may have moved o->items
+                        // array_grow_items may have moved o->items
                         if (src_items == dest_items) {
                             src_items = o->items;
                         }

@@ -278,6 +278,15 @@ typedef struct _mp_state_vm_t {
     // See mp_map_lookup.
     uint8_t map_lookup_cache[MICROPY_OPT_MAP_LOOKUP_CACHE_SIZE];
     #endif
+
+    #if MICROPY_BUFFER_PIN_MAX
+    // Storage ranges borrowed by native I/O; see mp_buffer_pin().
+    // Only modified with the GIL held.
+    struct {
+        const byte *start;
+        size_t len;
+    } buffer_pins[MICROPY_BUFFER_PIN_MAX];
+    #endif
 } mp_state_vm_t;
 
 // This structure holds state that is specific to a given thread. Everything

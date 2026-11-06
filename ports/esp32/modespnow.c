@@ -411,18 +411,56 @@ static const uint8_t *_get_peer(mp_obj_t mac_addr) {
     return _get_bytes_len(mac_addr, ESP_NOW_ETH_ALEN);
 }
 
-// Copy data from the ring buffer - wait if buffer is empty up to timeout_ms
-//    0: Success
-//   -1: Not enough data available to complete read (try again later)
-//   -2: Requested read is larger than buffer - will never succeed
-static int ringbuf_get_bytes_wait(ringbuf_t *r, uint8_t *data, size_t len, mp_int_t timeout_ms) {
+// The receive ring is written by recv_cb() on the WiFi task (core 0) and read
+// by Python (core 1). Each side owns one cursor: it reads the other cursor
+// with an acquire load and publishes its own with a release store, so data is
+// complete before the cursor that exposes it, and is consumed before the space
+// is reused.
+static size_t espnow_ring_avail(ringbuf_t *r) {
+    uint16_t iput = __atomic_load_n(&r->iput, __ATOMIC_ACQUIRE);
+    return (r->size + iput - r->iget) % r->size;
+}
+
+static size_t espnow_ring_free(ringbuf_t *r) {
+    uint16_t iget = __atomic_load_n(&r->iget, __ATOMIC_ACQUIRE);
+    return (r->size + iget - r->iput - 1) % r->size;
+}
+
+static int espnow_ring_get(ringbuf_t *r, uint8_t *data, size_t len) {
+    if (espnow_ring_avail(r) < len) {
+        return -1;
+    }
+    size_t pos = r->iget;
+    size_t first = MIN(len, (size_t)r->size - pos);
+    memcpy(data, r->buf + pos, first);
+    memcpy(data + first, r->buf, len - first);
+    __atomic_store_n(&r->iget, (uint16_t)((pos + len) % r->size), __ATOMIC_RELEASE);
+    return 0;
+}
+
+// Drop everything published so far (reader side only; never races recv_cb).
+static void espnow_ring_discard(ringbuf_t *r) {
+    __atomic_store_n(&r->iget, __atomic_load_n(&r->iput, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+}
+
+// Wait until at least len bytes are queued, without consuming them.
+// Callbacks run in the poll hook and may deactivate ESPNow, so the ring
+// buffer is looked up again on every iteration.
+// Returns true when the data is available, false on timeout.
+static bool espnow_wait_available(esp_espnow_obj_t *self, size_t len, mp_int_t timeout_ms) {
     mp_uint_t start = mp_hal_ticks_ms();
-    int status = 0;
-    while (((status = ringbuf_get_bytes(r, data, len)) == -1)
-           && (timeout_ms < 0 || (mp_uint_t)(mp_hal_ticks_ms() - start) < (mp_uint_t)timeout_ms)) {
+    for (;;) {
+        if (self->recv_buffer == NULL) {
+            check_esp_err(ESP_ERR_ESPNOW_NOT_INIT);
+        }
+        if (espnow_ring_avail(self->recv_buffer) >= len) {
+            return true;
+        }
+        if (timeout_ms >= 0 && (mp_uint_t)(mp_hal_ticks_ms() - start) >= (mp_uint_t)timeout_ms) {
+            return false;
+        }
         MICROPY_EVENT_POLL_HOOK;
     }
-    return status;
 }
 
 // ESPNow.recvinto(buffers[, timeout_ms]):
@@ -437,11 +475,27 @@ static int ringbuf_get_bytes_wait(ringbuf_t *r, uint8_t *data, size_t len, mp_in
 // Default timeout is set with ESPNow.config(timeout=milliseconds).
 // Return (None, None) on timeout.
 static mp_obj_t espnow_recvinto(size_t n_args, const mp_obj_t *args) {
+    // Convert the timeout first: its __int__ may run arbitrary Python code.
+    mp_int_t timeout_ms = ((n_args > 2 && args[2] != mp_const_none)
+            ? mp_obj_get_int(args[2]) : _get_singleton()->recv_timeout_ms);
     esp_espnow_obj_t *self = _get_singleton_initialised();
 
-    mp_int_t timeout_ms = ((n_args > 2 && args[2] != mp_const_none)
-            ? mp_obj_get_int(args[2]) : self->recv_timeout_ms);
+    // Validate the arguments now so bad calls fail without waiting; they are
+    // looked up again after the wait.
+    {
+        mp_obj_list_t *check = mp_obj_list_ensure(args[1], 2);
+        mp_buffer_info_t check_buf;
+        mp_get_buffer_raise(check->items[1], &check_buf, MP_BUFFER_WRITE);
+    }
 
+    // Wait for a whole packet (published atomically by recv_cb) before
+    // borrowing any buffer: callbacks run while waiting and may resize them
+    // or deactivate ESPNow.
+    if (!espnow_wait_available(self, sizeof(espnow_hdr_t), timeout_ms)) {
+        return MP_OBJ_NEW_SMALL_INT(0);    // Timeout waiting for packet
+    }
+
+    // From here on no Python code runs until the message is copied.
     mp_obj_list_t *list = mp_obj_list_ensure(args[1], 2);
     mp_obj_array_t *msg = MP_OBJ_TO_PTR(list->items[1]);
     mp_buffer_info_t msg_buf;
@@ -457,10 +511,10 @@ static mp_obj_t espnow_recvinto(size_t n_args, const mp_obj_t *args) {
 
     mp_get_buffer_raise(msg, &msg_buf, MP_BUFFER_WRITE);
 
-    // Read the packet header from the incoming buffer
+    // Read the packet header from the incoming buffer (already available)
     espnow_hdr_t hdr;
-    if (ringbuf_get_bytes_wait(self->recv_buffer, (uint8_t *)&hdr, sizeof(hdr), timeout_ms) < 0) {
-        return MP_OBJ_NEW_SMALL_INT(0);    // Timeout waiting for packet
+    if (espnow_ring_get(self->recv_buffer, (uint8_t *)&hdr, sizeof(hdr)) < 0) {
+        return MP_OBJ_NEW_SMALL_INT(0);
     }
     int msg_len = hdr.msg_len;
 
@@ -468,9 +522,9 @@ static mp_obj_t espnow_recvinto(size_t n_args, const mp_obj_t *args) {
     // and then read the message data
     if (hdr.magic != ESPNOW_MAGIC
         || msg_len > msg_buf.len
-        || ringbuf_get_bytes(self->recv_buffer, peer_buf, ESP_NOW_ETH_ALEN) < 0
-        || ringbuf_get_bytes(self->recv_buffer, msg_buf.buf, msg_len) < 0) {
-        ringbuf_reset(self->recv_buffer); // Prevent ringbuffer getting out of sync
+        || espnow_ring_get(self->recv_buffer, peer_buf, ESP_NOW_ETH_ALEN) < 0
+        || espnow_ring_get(self->recv_buffer, msg_buf.buf, msg_len) < 0) {
+        espnow_ring_discard(self->recv_buffer); // Prevent ringbuffer getting out of sync
         mp_raise_ValueError(MP_ERROR_TEXT("ESPNow.recv(): buffer error"));
     }
     if (mp_obj_is_type(msg, &mp_type_bytearray)) {
@@ -498,7 +552,7 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(espnow_recvinto_obj, 2, 3, espnow_rec
 static mp_obj_t espnow_any(const mp_obj_t _) {
     esp_espnow_obj_t *self = _get_singleton_initialised();
 
-    return ringbuf_avail(self->recv_buffer) ? mp_const_true : mp_const_false;
+    return espnow_ring_avail(self->recv_buffer) ? mp_const_true : mp_const_false;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(espnow_any_obj, espnow_any);
 
@@ -530,16 +584,37 @@ static void _wait_for_pending_responses(esp_espnow_obj_t *self) {
 //   True  if sync==True and message is received successfully by all recipients
 //   False if sync==True and message is not received by at least one recipient
 // Raises: EAGAIN if the internal espnow buffers are full.
+typedef struct _espnow_send_call_t {
+    const uint8_t *peer;
+    mp_buffer_info_t message;
+} espnow_send_call_t;
+
+static mp_obj_t espnow_send_call(void *ctx) {
+    espnow_send_call_t *call = ctx;
+    // Send the packet - try, try again if internal esp-now buffers are full.
+    // The poll hook runs callbacks; the message is pinned meanwhile.
+    esp_err_t err;
+    mp_uint_t start = mp_hal_ticks_ms();
+    while ((ESP_ERR_ESPNOW_NO_MEM == (err = esp_now_send(call->peer, call->message.buf, call->message.len)))
+           && (mp_uint_t)(mp_hal_ticks_ms() - start) < (mp_uint_t)DEFAULT_SEND_TIMEOUT_MS) {
+        MICROPY_EVENT_POLL_HOOK;
+    }
+    check_esp_err(err);           // Will raise OSError if e != ESP_OK
+    return mp_const_none;
+}
+
 static mp_obj_t espnow_send(size_t n_args, const mp_obj_t *args) {
     esp_espnow_obj_t *self = _get_singleton_initialised();
-    // Check the various combinations of input arguments
-    const uint8_t *peer = (n_args > 2 && args[1] != mp_const_none) ? _get_peer(args[1]) : NULL;
+    // Check the various combinations of input arguments. Copy the peer
+    // address: callbacks run while waiting below.
+    uint8_t peer_copy[ESP_NOW_ETH_ALEN];
+    const uint8_t *peer = NULL;
+    if (n_args > 2 && args[1] != mp_const_none) {
+        memcpy(peer_copy, _get_peer(args[1]), ESP_NOW_ETH_ALEN);
+        peer = peer_copy;
+    }
     mp_obj_t msg = (n_args > 2) ? args[2] : (n_args == 2) ? args[1] : MP_OBJ_NULL;
     bool sync = n_args <= 3 || args[3] == mp_const_none || mp_obj_is_true(args[3]);
-
-    // Get a pointer to the data buffer of the message
-    mp_buffer_info_t message;
-    mp_get_buffer_raise(msg, &message, MP_BUFFER_READ);
 
     if (sync) {
         // Flush out any pending responses.
@@ -549,15 +624,12 @@ static mp_obj_t espnow_send(size_t n_args, const mp_obj_t *args) {
         // call has sync=True.
         _wait_for_pending_responses(self);
     }
+    // Get a pointer to the data buffer of the message only after waiting.
+    espnow_send_call_t call;
+    call.peer = peer;
+    mp_get_buffer_raise(msg, &call.message, MP_BUFFER_READ);
     int saved_failures = self->tx_failures;
-    // Send the packet - try, try again if internal esp-now buffers are full.
-    esp_err_t err;
-    mp_uint_t start = mp_hal_ticks_ms();
-    while ((ESP_ERR_ESPNOW_NO_MEM == (err = esp_now_send(peer, message.buf, message.len)))
-           && (mp_uint_t)(mp_hal_ticks_ms() - start) < (mp_uint_t)DEFAULT_SEND_TIMEOUT_MS) {
-        MICROPY_EVENT_POLL_HOOK;
-    }
-    check_esp_err(err);           // Will raise OSError if e != ESP_OK
+    mp_buffer_pinned_call(call.message.buf, call.message.len, NULL, 0, espnow_send_call, &call);
     // Increment the sent packet count. If peer_addr==NULL msg will be
     // sent to all peers EXCEPT any broadcast or multicast addresses.
     self->tx_packets += ((peer == NULL) ? self->peer_count : 1);
@@ -594,11 +666,22 @@ static void send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t st
 // ESPNow packet.
 // If the buffer is full, drop the message and increment the dropped count.
 // Schedules the user callback if one has been registered (ESPNow.config()).
+// Copy len bytes into the ring at *pos without publishing them.
+static void ringbuf_copy_unpublished(ringbuf_t *r, size_t *pos, const uint8_t *data, size_t len) {
+    size_t first = MIN(len, (size_t)r->size - *pos);
+    memcpy(r->buf + *pos, data, first);
+    memcpy(r->buf, data + first, len - first);
+    *pos = (*pos + len) % r->size;
+}
+
 static void recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *msg, int msg_len) {
     esp_espnow_obj_t *self = _get_singleton();
     ringbuf_t *buf = self->recv_buffer;
+    if (buf == NULL) {
+        return;
+    }
     // TODO: Test this works with ">".
-    if (sizeof(espnow_pkt_t) + msg_len >= ringbuf_free(buf)) {
+    if (sizeof(espnow_pkt_t) + msg_len >= espnow_ring_free(buf)) {
         self->dropped_rx_pkts++;
         return;
     }
@@ -610,9 +693,13 @@ static void recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *msg, in
     header.time_ms = mp_hal_ticks_ms();
     #endif // MICROPY_PY_ESPNOW_RSSI
 
-    ringbuf_put_bytes(buf, (uint8_t *)&header, sizeof(header));
-    ringbuf_put_bytes(buf, recv_info->src_addr, ESP_NOW_ETH_ALEN);
-    ringbuf_put_bytes(buf, msg, msg_len);
+    // The reader runs on the other core: copy the complete packet first, then
+    // publish it with a single store so a header never appears without its body.
+    size_t pos = buf->iput;
+    ringbuf_copy_unpublished(buf, &pos, (const uint8_t *)&header, sizeof(header));
+    ringbuf_copy_unpublished(buf, &pos, recv_info->src_addr, ESP_NOW_ETH_ALEN);
+    ringbuf_copy_unpublished(buf, &pos, msg, msg_len);
+    __atomic_store_n(&buf->iput, (uint16_t)pos, __ATOMIC_RELEASE);
     self->rx_packets++;
     if (self->recv_cb != mp_const_none) {
         mp_sched_schedule(self->recv_cb, self->recv_cb_arg);
@@ -870,7 +957,7 @@ static mp_uint_t espnow_stream_ioctl(
     return (self->recv_buffer == NULL) ? 0 :  // If not initialised
            arg ^ (
                // If no data in the buffer, unset the Read ready flag
-               ((ringbuf_avail(self->recv_buffer) == 0) ? MP_STREAM_POLL_RD : 0) |
+               ((espnow_ring_avail(self->recv_buffer) == 0) ? MP_STREAM_POLL_RD : 0) |
                // If still waiting for responses, unset the Write ready flag
                ((self->tx_responses < self->tx_packets) ? MP_STREAM_POLL_WR : 0));
 }

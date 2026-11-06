@@ -817,11 +817,29 @@ int _socket_send(socket_obj_t *sock, const char *data, size_t datalen) {
     return count;
 }
 
+typedef struct _socket_send_call_t {
+    socket_obj_t *sock;
+    const char *data;
+    size_t len;
+} socket_send_call_t;
+
+static mp_obj_t socket_send_call(void *ctx) {
+    socket_send_call_t *call = ctx;
+    return mp_obj_new_int(_socket_send(call->sock, call->data, call->len));
+}
+
+// Send from a Python buffer, keeping it from being reallocated while the
+// GIL is released.
+static int socket_send_pinned(socket_obj_t *sock, const char *data, size_t len) {
+    socket_send_call_t call = { sock, data, len };
+    return mp_obj_get_int(mp_buffer_pinned_call(data, len, NULL, 0, socket_send_call, &call));
+}
+
 static mp_obj_t socket_send(const mp_obj_t arg0, const mp_obj_t arg1) {
     socket_obj_t *sock = MP_OBJ_TO_PTR(arg0);
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(arg1, &bufinfo, MP_BUFFER_READ);
-    int r = _socket_send(sock, bufinfo.buf, bufinfo.len);
+    int r = socket_send_pinned(sock, bufinfo.buf, bufinfo.len);
     return mp_obj_new_int(r);
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(socket_send_obj, socket_send);
@@ -832,7 +850,7 @@ static mp_obj_t socket_sendall(const mp_obj_t arg0, const mp_obj_t arg1) {
     socket_obj_t *sock = MP_OBJ_TO_PTR(arg0);
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(arg1, &bufinfo, MP_BUFFER_READ);
-    int r = _socket_send(sock, bufinfo.buf, bufinfo.len);
+    int r = socket_send_pinned(sock, bufinfo.buf, bufinfo.len);
     if (r < bufinfo.len) {
         mp_raise_OSError(MP_ETIMEDOUT);
     }
@@ -845,9 +863,8 @@ static mp_obj_t socket_write(size_t n_args, const mp_obj_t *args) {
     if (sock->timeout_ms == 0) {
         return mp_call_function_n_kw(MP_OBJ_FROM_PTR(&mp_stream_write_obj), n_args, 0, args);
     }
-    // Match stream_write's optional maximum length and offset exactly.
-    mp_buffer_info_t bufinfo;
-    mp_get_buffer_raise(args[1], &bufinfo, MP_BUFFER_READ);
+    // Match stream_write's optional maximum length and offset exactly;
+    // convert them before borrowing the buffer.
     size_t max_len = (size_t)-1;
     size_t off = 0;
     if (n_args == 3) {
@@ -855,15 +872,17 @@ static mp_obj_t socket_write(size_t n_args, const mp_obj_t *args) {
     } else if (n_args == 4) {
         off = mp_obj_get_int_truncated(args[2]);
         max_len = mp_obj_get_int_truncated(args[3]);
-        if (off > bufinfo.len) {
-            off = bufinfo.len;
-        }
+    }
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(args[1], &bufinfo, MP_BUFFER_READ);
+    if (off > bufinfo.len) {
+        off = bufinfo.len;
     }
     size_t size = MIN(bufinfo.len - off, max_len);
     if (size == 0) {
         return MP_OBJ_NEW_SMALL_INT(0);
     }
-    int count = _socket_send(sock, (const char *)bufinfo.buf + off, size);
+    int count = socket_send_pinned(sock, (const char *)bufinfo.buf + off, size);
     if (count < size) {
         mp_raise_OSError(MP_ETIMEDOUT);
     }
@@ -871,23 +890,18 @@ static mp_obj_t socket_write(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(socket_write_obj, 2, 4, socket_write);
 
-static mp_obj_t socket_sendto(mp_obj_t self_in, mp_obj_t data_in, mp_obj_t addr_in) {
-    socket_obj_t *self = MP_OBJ_TO_PTR(self_in);
-
-    // get the buffer to send
+typedef struct _socket_sendto_call_t {
+    socket_obj_t *self;
     mp_buffer_info_t bufinfo;
-    mp_get_buffer_raise(data_in, &bufinfo, MP_BUFFER_READ);
-
-    // create the destination address
     struct sockaddr_in to;
-    to.sin_len = sizeof(to);
-    to.sin_family = AF_INET;
-    to.sin_port = lwip_htons(netutils_parse_inet_addr(addr_in, (uint8_t *)&to.sin_addr, NETUTILS_BIG));
+} socket_sendto_call_t;
 
-    // send the data
-    for (int i = 0; i <= self->retries; i++) {
+static mp_obj_t socket_sendto_call(void *ctx) {
+    socket_sendto_call_t *call = ctx;
+    for (int i = 0; i <= call->self->retries; i++) {
         MP_THREAD_GIL_EXIT();
-        int ret = lwip_sendto(self->fd, bufinfo.buf, bufinfo.len, 0, (struct sockaddr *)&to, sizeof(to));
+        int ret = lwip_sendto(call->self->fd, call->bufinfo.buf, call->bufinfo.len, 0,
+            (struct sockaddr *)&call->to, sizeof(call->to));
         MP_THREAD_GIL_ENTER();
         if (ret > 0) {
             return mp_obj_new_int_from_uint(ret);
@@ -898,6 +912,20 @@ static mp_obj_t socket_sendto(mp_obj_t self_in, mp_obj_t data_in, mp_obj_t addr_
         check_for_exceptions();
     }
     mp_raise_OSError(MP_ETIMEDOUT);
+}
+
+static mp_obj_t socket_sendto(mp_obj_t self_in, mp_obj_t data_in, mp_obj_t addr_in) {
+    socket_sendto_call_t call;
+    call.self = MP_OBJ_TO_PTR(self_in);
+
+    // create the destination address first: parsing runs Python code
+    call.to.sin_len = sizeof(call.to);
+    call.to.sin_family = AF_INET;
+    call.to.sin_port = lwip_htons(netutils_parse_inet_addr(addr_in, (uint8_t *)&call.to.sin_addr, NETUTILS_BIG));
+
+    // get the buffer to send and keep it in place while the GIL is released
+    mp_get_buffer_raise(data_in, &call.bufinfo, MP_BUFFER_READ);
+    return mp_buffer_pinned_call(call.bufinfo.buf, call.bufinfo.len, NULL, 0, socket_sendto_call, &call);
 }
 static MP_DEFINE_CONST_FUN_OBJ_3(socket_sendto_obj, socket_sendto);
 

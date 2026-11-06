@@ -351,7 +351,16 @@ static mp_obj_t re_sub_helper(size_t n_args, const mp_obj_t *args) {
         vstr_add_strn(&vstr_return, subj.begin, match->caps[0] - subj.begin);
 
         // Get replacement string
-        const char *repl = mp_obj_str_get_str((mp_obj_is_callable(replace) ? mp_call_function_1(replace, MP_OBJ_FROM_PTR(match)) : replace));
+        // A callable replacement may keep its match object: pass a GC-owned
+        // copy (it references only the subject string, which it keeps alive).
+        mp_obj_t repl_obj = replace;
+        if (mp_obj_is_callable(replace)) {
+            size_t match_size = sizeof(mp_obj_match_t) + caps_num * sizeof(char *);
+            mp_obj_match_t *match_copy = m_malloc(match_size);
+            memcpy(match_copy, match, match_size);
+            repl_obj = mp_call_function_1(replace, MP_OBJ_FROM_PTR(match_copy));
+        }
+        const char *repl = mp_obj_str_get_str(repl_obj);
 
         // Append replacement string to result, substituting any regex groups
         while (*repl != '\0') {

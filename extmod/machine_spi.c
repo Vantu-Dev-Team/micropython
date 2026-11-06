@@ -54,10 +54,24 @@ static mp_obj_t machine_spi_deinit(mp_obj_t self) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(machine_spi_deinit_obj, machine_spi_deinit);
 
+typedef struct _spi_transfer_call_t {
+    mp_obj_base_t *spi;
+    size_t len;
+    const void *src;
+    void *dest;
+} spi_transfer_call_t;
+
+static mp_obj_t spi_transfer_call(void *ctx) {
+    spi_transfer_call_t *call = ctx;
+    mp_machine_spi_p_t *spi_p = (mp_machine_spi_p_t *)MP_OBJ_TYPE_GET_SLOT(call->spi->type, protocol);
+    spi_p->transfer(call->spi, call->len, call->src, call->dest);
+    return mp_const_none;
+}
+
+// Drivers may release the GIL during DMA; keep both buffers in place.
 static void mp_machine_spi_transfer(mp_obj_t self, size_t len, const void *src, void *dest) {
-    mp_obj_base_t *s = (mp_obj_base_t *)MP_OBJ_TO_PTR(self);
-    mp_machine_spi_p_t *spi_p = (mp_machine_spi_p_t *)MP_OBJ_TYPE_GET_SLOT(s->type, protocol);
-    spi_p->transfer(s, len, src, dest);
+    spi_transfer_call_t call = { (mp_obj_base_t *)MP_OBJ_TO_PTR(self), len, src, dest };
+    mp_buffer_pinned_call(src, len, dest == src ? NULL : dest, dest == NULL ? 0 : len, spi_transfer_call, &call);
 }
 
 static mp_obj_t mp_machine_spi_read(size_t n_args, const mp_obj_t *args) {
@@ -70,9 +84,10 @@ static mp_obj_t mp_machine_spi_read(size_t n_args, const mp_obj_t *args) {
 MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(mp_machine_spi_read_obj, 2, 3, mp_machine_spi_read);
 
 static mp_obj_t mp_machine_spi_readinto(size_t n_args, const mp_obj_t *args) {
+    int fill = n_args == 3 ? mp_obj_get_int(args[2]) : 0;
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(args[1], &bufinfo, MP_BUFFER_WRITE);
-    memset(bufinfo.buf, n_args == 3 ? mp_obj_get_int(args[2]) : 0, bufinfo.len);
+    memset(bufinfo.buf, fill, bufinfo.len);
     mp_machine_spi_transfer(args[0], bufinfo.len, bufinfo.buf, bufinfo.buf);
     return mp_const_none;
 }

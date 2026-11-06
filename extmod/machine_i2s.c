@@ -553,7 +553,7 @@ static mp_uint_t machine_i2s_stream_read(mp_obj_t self_in, void *buf_in, mp_uint
         descriptor.callback = self->callback_for_non_blocking;
         descriptor.direction = I2S_RX_TRANSFER;
         // send the descriptor to the task that handles non-blocking mode
-        xQueueSend(self->non_blocking_mode_queue, &descriptor, 0);
+        machine_i2s_queue_non_blocking(self, &descriptor);
         #endif
 
         return size;
@@ -595,7 +595,7 @@ static mp_uint_t machine_i2s_stream_write(mp_obj_t self_in, const void *buf_in, 
         descriptor.callback = self->callback_for_non_blocking;
         descriptor.direction = I2S_TX_TRANSFER;
         // send the descriptor to the task that handles non-blocking mode
-        xQueueSend(self->non_blocking_mode_queue, &descriptor, 0);
+        machine_i2s_queue_non_blocking(self, &descriptor);
         #endif
 
         return size;

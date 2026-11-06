@@ -1181,6 +1181,37 @@ size_t gc_nbytes(const void *ptr) {
     return 0;
 }
 
+// Return the start of the heap allocation containing ptr (which may point
+// anywhere inside it), or NULL if ptr is not inside an allocated block.
+void *gc_ptr_head(const void *ptr) {
+    GC_ENTER();
+
+    mp_state_mem_area_t *area;
+    #if MICROPY_GC_SPLIT_HEAP
+    area = gc_get_ptr_area(ptr);
+    #else
+    if (ptr >= (void *)MP_STATE_MEM(area).gc_pool_start && ptr < (void *)MP_STATE_MEM(area).gc_pool_end) {
+        area = &MP_STATE_MEM(area);
+    } else {
+        area = NULL;
+    }
+    #endif
+
+    void *head = NULL;
+    if (area) {
+        size_t block = BLOCK_FROM_PTR(area, ptr);
+        while (block > 0 && ATB_GET_KIND(area, block) == AT_TAIL) {
+            block -= 1;
+        }
+        if (ATB_GET_KIND(area, block) == AT_HEAD) {
+            head = (void *)PTR_FROM_BLOCK(area, block);
+        }
+    }
+
+    GC_EXIT();
+    return head;
+}
+
 void *gc_realloc(void *ptr_in, size_t n_bytes, bool allow_move) {
     // check for pure allocation
     if (ptr_in == NULL) {

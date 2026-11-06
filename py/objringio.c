@@ -30,11 +30,15 @@
 #if MICROPY_PY_MICROPYTHON_RINGIO
 
 #include "py/runtime.h"
+#include "py/gc.h"
 #include "py/stream.h"
 
 typedef struct _micropython_ringio_obj_t {
     mp_obj_base_t base;
     ringbuf_t ringbuffer;
+    #if MICROPY_ENABLE_GC
+    void *buf_head; // GC root for ringbuffer.buf, which may point inside a block
+    #endif
 } micropython_ringio_obj_t;
 
 static mp_obj_t micropython_ringio_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args) {
@@ -50,6 +54,11 @@ static mp_obj_t micropython_ringio_make_new(const mp_obj_type_t *type, size_t n_
     }
     micropython_ringio_obj_t *self = mp_obj_malloc(micropython_ringio_obj_t, type);
     self->ringbuffer.buf = bufinfo.buf;
+    // The buffer may be a slice (interior pointer) of a heap object, or its
+    // owner may grow and move: keep the allocation it lives in reachable.
+    #if MICROPY_ENABLE_GC
+    self->buf_head = gc_ptr_head(bufinfo.buf);
+    #endif
     self->ringbuffer.size = bufinfo.len;
     self->ringbuffer.iget = self->ringbuffer.iput = 0;
     return MP_OBJ_FROM_PTR(self);

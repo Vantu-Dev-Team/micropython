@@ -34,6 +34,7 @@
 #include "py/objarray.h"
 #include "py/qstr.h"
 #include "py/runtime.h"
+#include "py/smallint.h"
 #include "extmod/modbluetooth.h"
 #include <string.h>
 
@@ -78,6 +79,10 @@ typedef struct {
     mp_obj_array_t irq_data_data;
     mp_obj_bluetooth_uuid_t irq_data_uuid;
     ringbuf_t ringbuf;
+    #else
+    // Copy of the last GET_SECRET result: NimBLE reads it after the handler
+    // has returned and the GIL is released, so it must stay reachable.
+    mp_obj_t irq_secret;
     #endif
 } mp_obj_bluetooth_ble_t;
 
@@ -1139,17 +1144,24 @@ static MP_DEFINE_CONST_FUN_OBJ_1(bluetooth_ble_invoke_irq_obj, bluetooth_ble_inv
 
 #if MICROPY_PY_BLUETOOTH_USE_SYNC_EVENTS
 
+static mp_obj_t bluetooth_copy_view(const uint8_t *src, size_t len) {
+    byte *copy = m_new(byte, len ? len : 1);
+    memcpy(copy, src, len);
+    return mp_obj_new_memoryview('B', len, copy);
+}
+
 static mp_obj_t invoke_irq_handler_run(uint16_t event,
     const mp_int_t *numeric, size_t n_unsigned, size_t n_signed,
     const uint8_t *addr,
     const mp_obj_bluetooth_uuid_t *uuid,
     const uint8_t **data, uint16_t *data_len, size_t n_data) {
 
-    mp_obj_array_t mv_addr;
-    mp_obj_array_t mv_data[2];
+    // The handler may keep the tuple or its items beyond this call: build
+    // them from GC-owned copies instead of stack objects and stack/NimBLE
+    // buffers.
     assert(n_data <= 2);
 
-    mp_obj_tuple_t *data_tuple = mp_local_alloc(sizeof(mp_obj_tuple_t) + sizeof(mp_obj_t) * MICROPY_PY_BLUETOOTH_MAX_EVENT_DATA_TUPLE_LEN);
+    mp_obj_tuple_t *data_tuple = m_malloc(sizeof(mp_obj_tuple_t) + sizeof(mp_obj_t) * MICROPY_PY_BLUETOOTH_MAX_EVENT_DATA_TUPLE_LEN);
     data_tuple->base.type = &mp_type_tuple;
     data_tuple->len = 0;
 
@@ -1157,15 +1169,17 @@ static mp_obj_t invoke_irq_handler_run(uint16_t event,
         data_tuple->items[data_tuple->len++] = MP_OBJ_NEW_SMALL_INT(numeric[i]);
     }
     if (addr) {
-        mp_obj_memoryview_init(&mv_addr, 'B', 0, 6, (void *)addr);
-        data_tuple->items[data_tuple->len++] = MP_OBJ_FROM_PTR(&mv_addr);
+        data_tuple->items[data_tuple->len++] = bluetooth_copy_view(addr, 6);
     }
     for (size_t i = 0; i < n_signed; ++i) {
         data_tuple->items[data_tuple->len++] = MP_OBJ_NEW_SMALL_INT(numeric[i + n_unsigned]);
     }
     #if MICROPY_PY_BLUETOOTH_ENABLE_CENTRAL_MODE
     if (uuid) {
-        data_tuple->items[data_tuple->len++] = MP_OBJ_FROM_PTR(uuid);
+        // NimBLE may pass a stack UUID or one it later reuses.
+        mp_obj_bluetooth_uuid_t *uuid_copy = m_new_obj(mp_obj_bluetooth_uuid_t);
+        *uuid_copy = *uuid;
+        data_tuple->items[data_tuple->len++] = MP_OBJ_FROM_PTR(uuid_copy);
     }
     #endif
 
@@ -1198,8 +1212,7 @@ static mp_obj_t invoke_irq_handler_run(uint16_t event,
 
     for (size_t i = 0; i < n_data; ++i) {
         if (data[i]) {
-            mp_obj_memoryview_init(&mv_data[i], 'B', 0, data_len[i], (void *)data[i]);
-            data_tuple->items[data_tuple->len++] = MP_OBJ_FROM_PTR(&mv_data[i]);
+            data_tuple->items[data_tuple->len++] = bluetooth_copy_view(data[i], data_len[i]);
         } else {
             data_tuple->items[data_tuple->len++] = mp_const_none;
         }
@@ -1210,13 +1223,43 @@ static mp_obj_t invoke_irq_handler_run(uint16_t event,
     mp_obj_bluetooth_ble_t *o = MP_OBJ_TO_PTR(MP_STATE_VM(bluetooth));
     mp_obj_t result = mp_call_function_2(o->irq_handler, MP_OBJ_NEW_SMALL_INT(event), MP_OBJ_FROM_PTR(data_tuple));
 
+    // Callers read the result after the GIL and this exception guard are
+    // gone: convert it here into a value they can use without running Python
+    // or allocating.
+    switch (event) {
+        #if MICROPY_PY_BLUETOOTH_ENABLE_PAIRING_BONDING
+        case MP_BLUETOOTH_IRQ_GET_SECRET:
+            if (result != mp_const_none) {
+                mp_buffer_info_t bufinfo;
+                mp_get_buffer_raise(result, &bufinfo, MP_BUFFER_READ);
+                result = mp_obj_new_bytes(bufinfo.buf, bufinfo.len);
+                o->irq_secret = result;
+            }
+            break;
+        case MP_BLUETOOTH_IRQ_SET_SECRET:
+            result = mp_obj_new_bool(mp_obj_is_true(result));
+            break;
+        #endif
+        case MP_BLUETOOTH_IRQ_GATTS_READ_REQUEST:
+        #if MICROPY_PY_BLUETOOTH_ENABLE_L2CAP_CHANNELS
+        case MP_BLUETOOTH_IRQ_L2CAP_ACCEPT:
+        #endif
+        {
+            mp_int_t ret = 0;
+            mp_obj_get_int_maybe(result, &ret);
+            result = MP_OBJ_NEW_SMALL_INT(MP_SMALL_INT_FITS(ret) ? ret : 1);
+            break;
+        }
+        default:
+            break;
+    }
+
     #if MICROPY_PY_BLUETOOTH_USE_GATTC_EVENT_DATA_REASSEMBLY
+    // Only copied from (above), never handed to Python: safe to free now.
     if (buf_to_free != NULL) {
         m_del(uint8_t, (uint8_t *)buf_to_free, buf_to_free_len);
     }
     #endif
-
-    mp_local_free(data_tuple);
 
     return result;
 }
@@ -1273,6 +1316,11 @@ static mp_obj_t invoke_irq_handler(uint16_t event,
     mp_state_thread_t ts;
     if (ts_orig == NULL) {
         mp_thread_init_state(&ts, MICROPY_PY_BLUETOOTH_SYNC_EVENT_STACK_SIZE, NULL, NULL);
+        #ifdef MICROPY_PY_BLUETOOTH_SYNC_EVENT_GC_ENTER
+        // The handler may release the GIL (e.g. time.sleep); a collection on
+        // another thread must then still see objects held on this stack.
+        MICROPY_PY_BLUETOOTH_SYNC_EVENT_GC_ENTER((char *)&ts + sizeof(ts));
+        #endif
         MP_THREAD_GIL_ENTER();
     }
 
@@ -1282,6 +1330,9 @@ static mp_obj_t invoke_irq_handler(uint16_t event,
 
     if (ts_orig == NULL) {
         MP_THREAD_GIL_EXIT();
+        #ifdef MICROPY_PY_BLUETOOTH_SYNC_EVENT_GC_EXIT
+        MICROPY_PY_BLUETOOTH_SYNC_EVENT_GC_EXIT();
+        #endif
         mp_thread_set_state(ts_orig);
     }
 

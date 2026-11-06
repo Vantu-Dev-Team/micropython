@@ -632,6 +632,43 @@ static inline void mp_get_buffer_raise(mp_obj_t obj, mp_buffer_info_t *bufinfo, 
     mp_get_buffer(obj, bufinfo, flags | MP_BUFFER_RAISE_IF_UNSUPPORTED);
 }
 
+// Native code that keeps a pointer to a Python buffer while it releases the
+// GIL or runs callbacks pins the storage range first, so no other thread or
+// callback can reallocate (move) it meanwhile. Pin and unpin with the GIL
+// held; always unpin, including on exceptions (use nlr_push).
+// mp_buffer_pin returns a slot, or -1 when nothing needs pinning, and raises
+// OSError(ENOBUFS) when the table is full.
+#if MICROPY_BUFFER_PIN_MAX
+int mp_buffer_pin(const void *buf, size_t len);
+void mp_buffer_unpin(int slot);
+// Raise RuntimeError if [items, items + len) overlaps a pinned range.
+void mp_buffer_check_move(const void *items, size_t len);
+// Call fn(ctx) with up to two ranges pinned (buf2 may be NULL); unpins on return or exception.
+mp_obj_t mp_buffer_pinned_call(const void *buf1, size_t len1, const void *buf2, size_t len2,
+    mp_obj_t (*fn)(void *ctx), void *ctx);
+#else
+static inline mp_obj_t mp_buffer_pinned_call(const void *buf1, size_t len1, const void *buf2, size_t len2,
+    mp_obj_t (*fn)(void *ctx), void *ctx) {
+    (void)buf1;
+    (void)len1;
+    (void)buf2;
+    (void)len2;
+    return fn(ctx);
+}
+static inline int mp_buffer_pin(const void *buf, size_t len) {
+    (void)buf;
+    (void)len;
+    return -1;
+}
+static inline void mp_buffer_unpin(int slot) {
+    (void)slot;
+}
+static inline void mp_buffer_check_move(const void *items, size_t len) {
+    (void)items;
+    (void)len;
+}
+#endif
+
 // This struct will be updated to become a variable sized struct. In order to
 // use this as a member, or allocate dynamically, use the mp_obj_empty_type_t
 // or mp_obj_full_type_t structs below (which must be kept in sync).

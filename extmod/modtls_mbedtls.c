@@ -273,9 +273,12 @@ static int ssl_sock_cert_verify(void *ptr, mbedtls_x509_crt *crt, int depth, uin
     if (o->handler == mp_const_none) {
         return 0;
     }
-    mp_obj_array_t cert;
-    mp_obj_memoryview_init(&cert, 'B', 0, crt->raw.len, crt->raw.p);
-    return mp_obj_get_int(mp_call_function_2(o->handler, MP_OBJ_FROM_PTR(&cert), MP_OBJ_NEW_SMALL_INT(depth)));
+    // The handler may keep its argument: give it a view of a GC-owned copy
+    // of the certificate, not of mbedTLS storage via a stack object.
+    byte *der = m_new(byte, crt->raw.len ? crt->raw.len : 1);
+    memcpy(der, crt->raw.p, crt->raw.len);
+    mp_obj_t cert = mp_obj_new_memoryview('B', crt->raw.len, der);
+    return mp_obj_get_int(mp_call_function_2(o->handler, cert, MP_OBJ_NEW_SMALL_INT(depth)));
 }
 
 /******************************************************************************/
@@ -1092,8 +1095,10 @@ int micropy_mbedtls_ecdsa_sign_alt(const mbedtls_mpi *d, const unsigned char *ha
     mp_buffer_info_t sig_buf;
     if (nlr_push(&nlr) == 0) {
         mp_obj_t ret = mp_call_function_2(ssl_ctx->ecdsa_sign_callback,
-            mp_obj_new_bytearray_by_ref(klen, (void *)key),
-            mp_obj_new_bytearray_by_ref(hlen, (void *)hash));
+            // Copies: key lives on this C stack frame and hash in mbedTLS;
+            // the callback may keep or grow its arguments.
+            mp_obj_new_bytearray(klen, key),
+            mp_obj_new_bytearray(hlen, hash));
         if (ret == mp_const_none) {
             // key couldn't be used by the alternative implementation.
             nlr_pop();

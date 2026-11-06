@@ -84,6 +84,9 @@
 #define MICROPY_PY_TIME_INCLUDEFILE         "ports/esp32/modtime.c"
 #define MICROPY_PY_THREAD                   (1)
 #define MICROPY_PY_THREAD_GIL               (1)
+// Native I/O (sockets, streams, SPI, ESP-NOW) pins borrowed buffers so
+// another thread or callback cannot reallocate them meanwhile.
+#define MICROPY_BUFFER_PIN_MAX              (16)
 #define MICROPY_PY_THREAD_GIL_VM_DIVISOR    (32)
 
 #define MICROPY_GC_SPLIT_HEAP               (1)
@@ -104,6 +107,13 @@
 // by the NimBLE functions that call into invoke_irq_handler().
 // MICROPY_STACK_CHECK_MARGIN is further subtracted from this value to set the stack limit.
 #define MICROPY_PY_BLUETOOTH_SYNC_EVENT_STACK_SIZE (CONFIG_BT_NIMBLE_TASK_STACK_SIZE - 1024)
+#if MICROPY_PY_THREAD
+// Register the NimBLE host stack as a GC root while a Python IRQ handler runs.
+void mp_thread_foreign_stack_enter(void *stack_top);
+void mp_thread_foreign_stack_exit(void);
+#define MICROPY_PY_BLUETOOTH_SYNC_EVENT_GC_ENTER(top) mp_thread_foreign_stack_enter(top)
+#define MICROPY_PY_BLUETOOTH_SYNC_EVENT_GC_EXIT() mp_thread_foreign_stack_exit()
+#endif
 #define MICROPY_PY_BLUETOOTH_ENABLE_CENTRAL_MODE (1)
 #define MICROPY_PY_BLUETOOTH_ENABLE_PAIRING_BONDING (1)
 #define MICROPY_BLUETOOTH_NIMBLE            (1)

@@ -272,14 +272,25 @@ void mp_stream_write_adaptor(void *self, const char *buf, size_t len) {
     mp_stream_write(MP_OBJ_FROM_PTR(self), buf, len, MP_STREAM_RW_WRITE);
 }
 
-static mp_obj_t stream_readinto_write_generic(size_t n_args, const mp_obj_t *args, byte flags) {
-    mp_buffer_info_t bufinfo;
-    mp_get_buffer_raise(args[1], &bufinfo, (flags & MP_STREAM_RW_WRITE) ? MP_BUFFER_READ : MP_BUFFER_WRITE);
+typedef struct _stream_rw_call_t {
+    mp_obj_t stream;
+    void *buf;
+    size_t len;
+    byte flags;
+} stream_rw_call_t;
 
+static mp_obj_t stream_rw_call(void *ctx) {
+    stream_rw_call_t *call = ctx;
+    return mp_stream_write(call->stream, call->buf, call->len, call->flags);
+}
+
+static mp_obj_t stream_readinto_write_generic(size_t n_args, const mp_obj_t *args, byte flags) {
     // CPython extension, allow optional maximum length and offset:
     // - stream.operation(buf, max_len)
     // - stream.operation(buf, off, max_len)
     // Similar to https://docs.python.org/3/library/socket.html#socket.socket.recv_into
+    // Convert them first: an __int__ hook could otherwise move the buffer
+    // after its pointer was taken.
     size_t max_len = (size_t)-1;
     size_t off = 0;
     if (n_args == 3) {
@@ -287,14 +298,19 @@ static mp_obj_t stream_readinto_write_generic(size_t n_args, const mp_obj_t *arg
     } else if (n_args == 4) {
         off = mp_obj_get_int_truncated(args[2]);
         max_len = mp_obj_get_int_truncated(args[3]);
-        if (off > bufinfo.len) {
-            off = bufinfo.len;
-        }
+    }
+
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(args[1], &bufinfo, (flags & MP_STREAM_RW_WRITE) ? MP_BUFFER_READ : MP_BUFFER_WRITE);
+    if (off > bufinfo.len) {
+        off = bufinfo.len;
     }
     bufinfo.len -= off;
 
-    // Perform the readinto or write operation.
-    return mp_stream_write(args[0], (byte *)bufinfo.buf + off, MIN(bufinfo.len, max_len), flags);
+    // Perform the readinto or write operation. The stream may release the
+    // GIL, so keep the borrowed storage from being reallocated meanwhile.
+    stream_rw_call_t call = { args[0], (byte *)bufinfo.buf + off, MIN(bufinfo.len, max_len), flags };
+    return mp_buffer_pinned_call(call.buf, call.len, NULL, 0, stream_rw_call, &call);
 }
 
 static mp_obj_t stream_write_method(size_t n_args, const mp_obj_t *args) {

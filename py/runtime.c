@@ -71,6 +71,11 @@ MP_REGISTER_MODULE(MP_QSTR___main__, mp_module___main__);
 void mp_init(void) {
     qstr_init();
 
+    #if MICROPY_BUFFER_PIN_MAX
+    // No native I/O survives a soft reset.
+    memset(MP_STATE_VM(buffer_pins), 0, sizeof(MP_STATE_VM(buffer_pins)));
+    #endif
+
     // no pending exceptions to start with
     MP_STATE_THREAD(mp_pending_exception) = MP_OBJ_NULL;
     #if MICROPY_ENABLE_SCHEDULER

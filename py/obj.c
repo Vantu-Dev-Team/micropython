@@ -35,6 +35,7 @@
 #include "py/objstr.h"
 #include "py/runtime.h"
 #include "py/cstack.h"
+#include "py/mperrno.h"
 #include "py/stream.h" // for mp_obj_print
 
 // Allocates an object and also sets type, for mp_obj_malloc{,_var} macros.
@@ -613,6 +614,58 @@ MP_DEFINE_CONST_FUN_OBJ_1(mp_identity_obj, mp_identity);
 //     (void)iter_buf;
 //     return self;
 // }
+
+#if MICROPY_BUFFER_PIN_MAX
+int mp_buffer_pin(const void *buf, size_t len) {
+    if (buf == NULL || len == 0) {
+        return -1;
+    }
+    for (int i = 0; i < MICROPY_BUFFER_PIN_MAX; ++i) {
+        if (MP_STATE_VM(buffer_pins)[i].start == NULL) {
+            MP_STATE_VM(buffer_pins)[i].start = buf;
+            MP_STATE_VM(buffer_pins)[i].len = len;
+            return i;
+        }
+    }
+    mp_raise_OSError(MP_ENOBUFS);
+}
+
+void mp_buffer_unpin(int slot) {
+    if (slot >= 0 && slot < MICROPY_BUFFER_PIN_MAX) {
+        MP_STATE_VM(buffer_pins)[slot].start = NULL;
+        MP_STATE_VM(buffer_pins)[slot].len = 0;
+    }
+}
+
+mp_obj_t mp_buffer_pinned_call(const void *buf1, size_t len1, const void *buf2, size_t len2,
+    mp_obj_t (*fn)(void *ctx), void *ctx) {
+    int slot1 = mp_buffer_pin(buf1, len1);
+    // Modified after nlr_push (setjmp): must be volatile to be read back on the exception path.
+    volatile int slot2 = -1;
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        slot2 = mp_buffer_pin(buf2, len2);
+        mp_obj_t result = fn(ctx);
+        nlr_pop();
+        mp_buffer_unpin(slot2);
+        mp_buffer_unpin(slot1);
+        return result;
+    }
+    mp_buffer_unpin(slot2);
+    mp_buffer_unpin(slot1);
+    nlr_jump(nlr.ret_val);
+}
+
+void mp_buffer_check_move(const void *items, size_t len) {
+    const byte *start = items;
+    for (int i = 0; i < MICROPY_BUFFER_PIN_MAX; ++i) {
+        const byte *pin = MP_STATE_VM(buffer_pins)[i].start;
+        if (pin != NULL && pin < start + len && start < pin + MP_STATE_VM(buffer_pins)[i].len) {
+            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("buffer in use by I/O"));
+        }
+    }
+}
+#endif
 
 bool mp_get_buffer(mp_obj_t obj, mp_buffer_info_t *bufinfo, mp_uint_t flags) {
     const mp_obj_type_t *type = mp_obj_get_type(obj);
