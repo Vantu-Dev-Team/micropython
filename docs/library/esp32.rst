@@ -616,6 +616,17 @@ supports 32-bit signed integers and blobs.
 
     Commits changes made by *set_xxx* methods to flash.
 
+.. method:: NVS.close()
+
+    Release this object's native namespace handle. Calling ``close()`` again is
+    harmless. This does not commit changes or erase the namespace; call
+    ``commit()`` before closing when changes must be persisted. Other handles
+    for the same namespace remain usable.
+
+    The handle is also released automatically when the object is garbage
+    collected. After explicit close, data access and ``commit()`` raise
+    ``OSError(EBADF)``. This lifetime-management extension is provided by Sento.
+
 .. _esp32.LDO:
 
 Low Dropout Voltage Regulator (LDO)
