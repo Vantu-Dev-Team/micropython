@@ -684,7 +684,13 @@ static mp_uint_t _socket_read_data(mp_obj_t self_in, void *buf, size_t size, mp_
 mp_obj_t _socket_recvfrom(size_t n_args, const mp_obj_t *args,
     struct sockaddr *from, socklen_t *from_len) {
     mp_obj_t self_in = args[0];
-    size_t len = mp_obj_get_int(args[1]);
+    mp_int_t requested = mp_obj_get_int(args[1]);
+    if (requested < 0) {
+        // A negative length would wrap to SIZE_MAX: vstr allocates one byte
+        // while lwIP copies the whole datagram into it.
+        mp_raise_ValueError(MP_ERROR_TEXT("negative buffersize"));
+    }
+    size_t len = requested;
     int flags = n_args > 2 ? mp_obj_get_int(args[2]) : 0;
 
     vstr_t vstr;

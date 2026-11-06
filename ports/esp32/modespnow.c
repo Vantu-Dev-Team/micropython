@@ -276,6 +276,11 @@ static mp_obj_t espnow_config(size_t n_args, const mp_obj_t *pos_args, mp_map_t 
         MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
     if (args[ARG_rxbuf].u_int >= 0) {
+        // ringbuf_t.size is uint16_t and is used as a modulus: zero or a
+        // truncated size divides by zero in ringbuf_avail().
+        if (args[ARG_rxbuf].u_int == 0 || args[ARG_rxbuf].u_int > UINT16_MAX) {
+            mp_raise_ValueError(MP_ERROR_TEXT("rxbuf out of range"));
+        }
         self->recv_buffer_size = args[ARG_rxbuf].u_int;
     }
     if (args[ARG_timeout_ms].u_int != INT_MIN) {
