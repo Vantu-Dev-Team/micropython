@@ -274,6 +274,9 @@ static size_t copy_appbuf_to_dma(machine_i2s_obj_t *self, mp_buffer_info_t *appb
 // Queue a non-blocking transfer. As before, a request made while one is
 // already queued is dropped; its buffer is then never used.
 static void machine_i2s_queue_non_blocking(machine_i2s_obj_t *self, non_blocking_descriptor_t *descriptor) {
+    if (self->non_blocking_mode_queue == NULL || self->non_blocking_mode_task == NULL) {
+        return;
+    }
     for (uint8_t i = 0; i < MP_ARRAY_SIZE(self->nb_slot); i++) {
         if (__atomic_load_n(&self->nb_slot[i].busy, __ATOMIC_ACQUIRE)) {
             continue;
@@ -494,6 +497,10 @@ static void mp_machine_i2s_irq_update(machine_i2s_obj_t *self) {
         // create a queue linking the MicroPython task to a FreeRTOS task
         // that manages the non blocking mode of operation
         self->non_blocking_mode_queue = xQueueCreate(1, sizeof(uint8_t));
+        if (self->non_blocking_mode_queue == NULL) {
+            self->io_mode = BLOCKING;
+            mp_raise_type(&mp_type_MemoryError);
+        }
 
         // non-blocking mode requires a background FreeRTOS task
         if (xTaskCreatePinnedToCore(
@@ -505,6 +512,11 @@ static void mp_machine_i2s_irq_update(machine_i2s_obj_t *self) {
             (TaskHandle_t *)&self->non_blocking_mode_task,
             MP_TASK_COREID) != pdPASS) {
 
+            // Leave a consistent blocking-mode object behind.
+            vQueueDelete(self->non_blocking_mode_queue);
+            self->non_blocking_mode_queue = NULL;
+            self->non_blocking_mode_task = NULL;
+            self->io_mode = BLOCKING;
             mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("failed to create I2S task"));
         }
     } else {
