@@ -510,6 +510,9 @@ static mp_obj_t socket_setsockopt(size_t n_args, const mp_obj_t *args) {
             size_t len;
             const char *val = mp_obj_str_get_data(args[3], &len);
             char ifname[NETIF_NAMESIZE] = {0};
+            if (len >= sizeof(ifname)) {
+                mp_raise_ValueError(MP_ERROR_TEXT("interface name too long"));
+            }
             memcpy(&ifname, val, len);
             int ret = lwip_setsockopt(self->fd, SOL_SOCKET, opt, &ifname, NETIF_NAMESIZE);
             if (ret != 0) {
