@@ -54,6 +54,7 @@
 #include "lwip/ip4.h"
 #include "lwip/igmp.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 // See note at bottom of file about why this isn't MICROPY_PY_SOCKET
 #if MICROPY_PY_NETWORK
@@ -80,6 +81,7 @@ typedef struct _socket_obj_t {
     uint8_t proto;
     uint8_t state;
     unsigned int retries;
+    uint64_t timeout_ms;
     #if MICROPY_PY_SOCKET_EVENTS
     mp_obj_t events_callback;
     struct _socket_obj_t *events_next;
@@ -570,8 +572,9 @@ static mp_obj_t socket_setsockopt(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(socket_setsockopt_obj, 4, 4, socket_setsockopt);
 
 void _socket_settimeout(socket_obj_t *sock, uint64_t timeout_ms) {
-    // Rather than waiting for the entire timeout specified, we wait sock->retries times
-    // for SOCKET_POLL_US each, checking for a MicroPython interrupt between timeouts.
+    sock->timeout_ms = timeout_ms;
+    // Legacy receive/connection loops use retries of SOCKET_POLL_US,
+    // checking for interrupts between waits. Writes use timeout_ms directly.
     // with SOCKET_POLL_MS == 100ms, sock->retries allows for timeouts up to 13 years.
     // if timeout_ms == UINT64_MAX, wait forever.
     sock->retries = (timeout_ms == UINT64_MAX) ? UINT_MAX : timeout_ms * 1000 / SOCKET_POLL_US;
@@ -708,25 +711,95 @@ static mp_obj_t socket_recvfrom(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(socket_recvfrom_obj, 2, 3, socket_recvfrom);
 
-int _socket_send(socket_obj_t *sock, const char *data, size_t datalen) {
-    int sentlen = 0;
-    for (int i = 0; i <= sock->retries && sentlen < datalen; i++) {
-        MP_THREAD_GIL_EXIT();
-        int r = lwip_write(sock->fd, data + sentlen, datalen - sentlen);
-        MP_THREAD_GIL_ENTER();
-        // lwip returns EINPROGRESS when trying to send right after a non-blocking connect
-        if (r < 0 && errno != EWOULDBLOCK && errno != EINPROGRESS) {
-            mp_raise_OSError(errno);
+static mp_uint_t socket_write_data(socket_obj_t *sock, const void *data, size_t size,
+    bool write_all, int *errcode) {
+    size_t sent = 0;
+    uint64_t timeout_ms = sock->timeout_ms;
+    uint64_t started = esp_timer_get_time();
+    bool attempted = false;
+    bool ready_event = false;
+    for (;;) {
+        int fd = sock->fd;
+        if (fd < 0) {
+            *errcode = MP_EBADF;
+            return MP_STREAM_ERROR;
         }
-        if (r > 0) {
-            sentlen += r;
+        uint64_t elapsed_ms = ((uint64_t)esp_timer_get_time() - started) / 1000;
+        if (attempted && !ready_event && timeout_ms != UINT64_MAX && elapsed_ms >= timeout_ms) {
+            break;
+        }
+        ready_event = false;
+        attempted = true;
+        // A timed lwip_write can wait for the much slower TCP poll callback.
+        // Keep the GIL through non-blocking fd consumption; only select yields.
+        int count = lwip_send(fd, (const uint8_t *)data + sent, size - sent, MSG_DONTWAIT);
+        int error = errno;
+        if (count > 0 || (count == 0 && size == 0)) {
+            sent += count;
+            if (!write_all || sent == size) {
+                return sent;
+            }
+            check_for_exceptions();
+            continue;
+        }
+        if (count < 0 && error != EWOULDBLOCK && error != EINPROGRESS) {
+            *errcode = error;
+            return MP_STREAM_ERROR;
         }
         check_for_exceptions();
+        #if MICROPY_ENABLE_SCHEDULER && MICROPY_PY_THREAD_GIL
+        if (MP_STATE_VM(sched_state) < 0) {
+            // A scheduler-locked callback must not hand the GIL to a thread
+            // whose VM cannot hand it back until this callback returns.
+            if (sent) {
+                return sent;
+            }
+            *errcode = timeout_ms == 0 ? MP_EWOULDBLOCK : MP_ETIMEDOUT;
+            return MP_STREAM_ERROR;
+        }
+        #endif
+        elapsed_ms = ((uint64_t)esp_timer_get_time() - started) / 1000;
+        if (timeout_ms != UINT64_MAX && elapsed_ms >= timeout_ms) {
+            break;
+        }
+        fd = sock->fd;
+        if (fd < 0) {
+            *errcode = MP_EBADF;
+            return MP_STREAM_ERROR;
+        }
+        uint64_t wait_us = SOCKET_POLL_US;
+        if (timeout_ms != UINT64_MAX && timeout_ms - elapsed_ms < SOCKET_POLL_US / 1000) {
+            wait_us = (timeout_ms - elapsed_ms) * 1000;
+        }
+        fd_set writable;
+        FD_ZERO(&writable);
+        FD_SET(fd, &writable);
+        struct timeval wait = { .tv_sec = 0, .tv_usec = wait_us };
+        MP_THREAD_GIL_EXIT();
+        int ready = select(fd + 1, NULL, &writable, NULL, &wait);
+        error = errno;
+        MP_THREAD_GIL_ENTER();
+        check_for_exceptions();
+        if (ready < 0) {
+            *errcode = error;
+            return MP_STREAM_ERROR;
+        }
+        ready_event = ready > 0;
     }
-    if (sentlen == 0) {
-        mp_raise_OSError(sock->retries == 0 ? MP_EWOULDBLOCK : MP_ETIMEDOUT);
+    if (sent) {
+        return sent;
     }
-    return sentlen;
+    *errcode = timeout_ms == 0 ? MP_EWOULDBLOCK : MP_ETIMEDOUT;
+    return MP_STREAM_ERROR;
+}
+
+int _socket_send(socket_obj_t *sock, const char *data, size_t datalen) {
+    int errcode;
+    mp_uint_t count = socket_write_data(sock, data, datalen, true, &errcode);
+    if (count == MP_STREAM_ERROR) {
+        mp_raise_OSError(errcode);
+    }
+    return count;
 }
 
 static mp_obj_t socket_send(const mp_obj_t arg0, const mp_obj_t arg1) {
@@ -751,6 +824,37 @@ static mp_obj_t socket_sendall(const mp_obj_t arg0, const mp_obj_t arg1) {
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(socket_sendall_obj, socket_sendall);
+
+static mp_obj_t socket_write(size_t n_args, const mp_obj_t *args) {
+    socket_obj_t *sock = MP_OBJ_TO_PTR(args[0]);
+    if (sock->timeout_ms == 0) {
+        return mp_call_function_n_kw(MP_OBJ_FROM_PTR(&mp_stream_write_obj), n_args, 0, args);
+    }
+    // Match stream_write's optional maximum length and offset exactly.
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(args[1], &bufinfo, MP_BUFFER_READ);
+    size_t max_len = (size_t)-1;
+    size_t off = 0;
+    if (n_args == 3) {
+        max_len = mp_obj_get_int_truncated(args[2]);
+    } else if (n_args == 4) {
+        off = mp_obj_get_int_truncated(args[2]);
+        max_len = mp_obj_get_int_truncated(args[3]);
+        if (off > bufinfo.len) {
+            off = bufinfo.len;
+        }
+    }
+    size_t size = MIN(bufinfo.len - off, max_len);
+    if (size == 0) {
+        return MP_OBJ_NEW_SMALL_INT(0);
+    }
+    int count = _socket_send(sock, (const char *)bufinfo.buf + off, size);
+    if (count < size) {
+        mp_raise_OSError(MP_ETIMEDOUT);
+    }
+    return MP_OBJ_NEW_SMALL_INT(count);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(socket_write_obj, 2, 4, socket_write);
 
 static mp_obj_t socket_sendto(mp_obj_t self_in, mp_obj_t data_in, mp_obj_t addr_in) {
     socket_obj_t *self = MP_OBJ_TO_PTR(self_in);
@@ -800,22 +904,7 @@ static mp_uint_t socket_stream_read(mp_obj_t self_in, void *buf, mp_uint_t size,
 
 static mp_uint_t socket_stream_write(mp_obj_t self_in, const void *buf, mp_uint_t size, int *errcode) {
     socket_obj_t *sock = self_in;
-    for (int i = 0; i <= sock->retries; i++) {
-        MP_THREAD_GIL_EXIT();
-        int r = lwip_write(sock->fd, buf, size);
-        MP_THREAD_GIL_ENTER();
-        if (r > 0) {
-            return r;
-        }
-        // lwip returns MP_EINPROGRESS when trying to write right after a non-blocking connect
-        if (r < 0 && errno != EWOULDBLOCK && errno != EINPROGRESS) {
-            *errcode = errno;
-            return MP_STREAM_ERROR;
-        }
-        check_for_exceptions();
-    }
-    *errcode = sock->retries == 0 ? MP_EWOULDBLOCK : MP_ETIMEDOUT;
-    return MP_STREAM_ERROR;
+    return socket_write_data(sock, buf, size, false, errcode);
 }
 
 static mp_uint_t socket_stream_ioctl(mp_obj_t self_in, mp_uint_t request, uintptr_t arg, int *errcode) {
@@ -908,7 +997,7 @@ static const mp_rom_map_elem_t socket_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_read), MP_ROM_PTR(&mp_stream_read_obj) },
     { MP_ROM_QSTR(MP_QSTR_readinto), MP_ROM_PTR(&mp_stream_readinto_obj) },
     { MP_ROM_QSTR(MP_QSTR_readline), MP_ROM_PTR(&mp_stream_unbuffered_readline_obj) },
-    { MP_ROM_QSTR(MP_QSTR_write), MP_ROM_PTR(&mp_stream_write_obj) },
+    { MP_ROM_QSTR(MP_QSTR_write), MP_ROM_PTR(&socket_write_obj) },
 };
 static MP_DEFINE_CONST_DICT(socket_locals_dict, socket_locals_dict_table);
 
