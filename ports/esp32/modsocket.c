@@ -51,6 +51,7 @@
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "lwip/dns.h"
 #include "lwip/ip4.h"
 #include "lwip/igmp.h"
 #include "esp_log.h"
@@ -170,6 +171,11 @@ static int mdns_getaddrinfo(const char *host_str, const char *port_str,
     if (host_len <= local_len ||
         strcasecmp(host_str + host_len - local_len, MDNS_LOCAL_SUFFIX) != 0) {
         return 0;
+    }
+
+    if (host_len >= DNS_MAX_NAME_LENGTH) {
+        *res = NULL;
+        return EAI_NONAME;
     }
 
     // mDNS query
@@ -510,6 +516,9 @@ static mp_obj_t socket_setsockopt(size_t n_args, const mp_obj_t *args) {
             size_t len;
             const char *val = mp_obj_str_get_data(args[3], &len);
             char ifname[NETIF_NAMESIZE] = {0};
+            if (len >= sizeof(ifname)) {
+                mp_raise_ValueError(MP_ERROR_TEXT("interface name too long"));
+            }
             memcpy(&ifname, val, len);
             int ret = lwip_setsockopt(self->fd, SOL_SOCKET, opt, &ifname, NETIF_NAMESIZE);
             if (ret != 0) {
@@ -675,7 +684,13 @@ static mp_uint_t _socket_read_data(mp_obj_t self_in, void *buf, size_t size, mp_
 mp_obj_t _socket_recvfrom(size_t n_args, const mp_obj_t *args,
     struct sockaddr *from, socklen_t *from_len) {
     mp_obj_t self_in = args[0];
-    size_t len = mp_obj_get_int(args[1]);
+    mp_int_t requested = mp_obj_get_int(args[1]);
+    if (requested < 0) {
+        // A negative length would wrap to SIZE_MAX: vstr allocates one byte
+        // while lwIP copies the whole datagram into it.
+        mp_raise_ValueError(MP_ERROR_TEXT("negative buffersize"));
+    }
+    size_t len = requested;
     int flags = n_args > 2 ? mp_obj_get_int(args[2]) : 0;
 
     vstr_t vstr;
