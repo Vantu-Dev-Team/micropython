@@ -27,6 +27,7 @@
 // This file is never compiled standalone, it's included directly from
 // extmod/machine_i2s.c via MICROPY_PY_MACHINE_I2S_INCLUDEFILE.
 
+#include "py/gc.h"
 #include "py/mphal.h"
 #include "driver/i2s_std.h"
 #include "freertos/FreeRTOS.h"
@@ -87,6 +88,11 @@ typedef struct _machine_i2s_obj_t {
     QueueHandle_t non_blocking_mode_queue;
     TaskHandle_t non_blocking_mode_task;
     dma_buffer_status_t dma_buffer_status;
+    // GC roots for the user buffer of the queued and the in-progress
+    // non-blocking transfer: the queue and the worker task's stack are not
+    // scanned, and Python may drop or grow the buffer meanwhile.
+    void *nb_pending_buf;
+    void *nb_active_buf;
 } machine_i2s_obj_t;
 
 static mp_obj_t machine_i2s_deinit(mp_obj_t self_in);
@@ -259,6 +265,18 @@ static size_t copy_appbuf_to_dma(machine_i2s_obj_t *self, mp_buffer_info_t *appb
     return num_bytes_written;
 }
 
+// Queue a non-blocking transfer, keeping its buffer reachable by the GC until
+// the worker task has finished with it. As before, a request made while one
+// is already queued is dropped; its buffer is then never used.
+static void machine_i2s_queue_non_blocking(machine_i2s_obj_t *self, non_blocking_descriptor_t *descriptor) {
+    if (uxQueueSpacesAvailable(self->non_blocking_mode_queue) == 0) {
+        return;
+    }
+    void *head = gc_ptr_head(descriptor->appbuf.buf);
+    __atomic_store_n(&self->nb_pending_buf, head != NULL ? head : descriptor->appbuf.buf, __ATOMIC_RELEASE);
+    xQueueSend(self->non_blocking_mode_queue, descriptor, 0);
+}
+
 // FreeRTOS task used for non-blocking mode
 static void task_for_non_blocking_mode(void *self_in) {
     machine_i2s_obj_t *self = (machine_i2s_obj_t *)self_in;
@@ -267,11 +285,15 @@ static void task_for_non_blocking_mode(void *self_in) {
 
     for (;;) {
         if (xQueueReceive(self->non_blocking_mode_queue, &descriptor, portMAX_DELAY)) {
+            // Hand the root over: it is held in at least one slot throughout.
+            __atomic_store_n(&self->nb_active_buf, __atomic_load_n(&self->nb_pending_buf, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+            __atomic_store_n(&self->nb_pending_buf, NULL, __ATOMIC_RELEASE);
             if (descriptor.direction == I2S_TX_TRANSFER) {
                 copy_appbuf_to_dma(self, &descriptor.appbuf);
             } else { // RX
                 fill_appbuf_from_dma(self, &descriptor.appbuf);
             }
+            __atomic_store_n(&self->nb_active_buf, NULL, __ATOMIC_RELEASE);
             mp_sched_schedule(descriptor.callback, MP_OBJ_FROM_PTR(self));
         }
     }
@@ -351,6 +373,8 @@ static void mp_machine_i2s_init_helper(machine_i2s_obj_t *self, mp_arg_val_t *ar
     self->callback_for_non_blocking = MP_OBJ_NULL;
     self->non_blocking_mode_queue = NULL;
     self->non_blocking_mode_task = NULL;
+    self->nb_pending_buf = NULL;
+    self->nb_active_buf = NULL;
     self->io_mode = BLOCKING;
     self->is_deinit = false;
 
@@ -438,6 +462,9 @@ static void mp_machine_i2s_deinit(machine_i2s_obj_t *self) {
             vQueueDelete(self->non_blocking_mode_queue);
             self->non_blocking_mode_queue = NULL;
         }
+        // The worker task is gone: no transfer uses these buffers any more.
+        self->nb_pending_buf = NULL;
+        self->nb_active_buf = NULL;
         self->is_deinit = true;
     }
 }

@@ -34,6 +34,7 @@
 #include "py/objarray.h"
 #include "py/qstr.h"
 #include "py/runtime.h"
+#include "py/smallint.h"
 #include "extmod/modbluetooth.h"
 #include <string.h>
 
@@ -78,6 +79,10 @@ typedef struct {
     mp_obj_array_t irq_data_data;
     mp_obj_bluetooth_uuid_t irq_data_uuid;
     ringbuf_t ringbuf;
+    #else
+    // Copy of the last GET_SECRET result: NimBLE reads it after the handler
+    // has returned and the GIL is released, so it must stay reachable.
+    mp_obj_t irq_secret;
     #endif
 } mp_obj_bluetooth_ble_t;
 
@@ -1217,6 +1222,37 @@ static mp_obj_t invoke_irq_handler_run(uint16_t event,
 
     mp_obj_bluetooth_ble_t *o = MP_OBJ_TO_PTR(MP_STATE_VM(bluetooth));
     mp_obj_t result = mp_call_function_2(o->irq_handler, MP_OBJ_NEW_SMALL_INT(event), MP_OBJ_FROM_PTR(data_tuple));
+
+    // Callers read the result after the GIL and this exception guard are
+    // gone: convert it here into a value they can use without running Python
+    // or allocating.
+    switch (event) {
+        #if MICROPY_PY_BLUETOOTH_ENABLE_PAIRING_BONDING
+        case MP_BLUETOOTH_IRQ_GET_SECRET:
+            if (result != mp_const_none) {
+                mp_buffer_info_t bufinfo;
+                mp_get_buffer_raise(result, &bufinfo, MP_BUFFER_READ);
+                result = mp_obj_new_bytes(bufinfo.buf, bufinfo.len);
+                o->irq_secret = result;
+            }
+            break;
+        case MP_BLUETOOTH_IRQ_SET_SECRET:
+            result = mp_obj_new_bool(mp_obj_is_true(result));
+            break;
+        #endif
+        case MP_BLUETOOTH_IRQ_GATTS_READ_REQUEST:
+        #if MICROPY_PY_BLUETOOTH_ENABLE_L2CAP_CHANNELS
+        case MP_BLUETOOTH_IRQ_L2CAP_ACCEPT:
+        #endif
+        {
+            mp_int_t ret = 0;
+            mp_obj_get_int_maybe(result, &ret);
+            result = MP_OBJ_NEW_SMALL_INT(MP_SMALL_INT_FITS(ret) ? ret : 1);
+            break;
+        }
+        default:
+            break;
+    }
 
     #if MICROPY_PY_BLUETOOTH_USE_GATTC_EVENT_DATA_REASSEMBLY
     // Only copied from (above), never handed to Python: safe to free now.

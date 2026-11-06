@@ -203,6 +203,7 @@ void mp_thread_finish(void) {
 // thread, while the callback has released the GIL, see objects it holds.
 // Only one such task runs Python callbacks, and never reentrantly.
 static mp_thread_t foreign_entry;
+static bool foreign_active;
 
 void mp_thread_foreign_stack_enter(void *stack_top) {
     mp_thread_mutex_lock(&thread_mutex, 1);
@@ -215,6 +216,7 @@ void mp_thread_foreign_stack_enter(void *stack_top) {
     foreign_entry.foreign = true;
     foreign_entry.next = thread;
     thread = &foreign_entry;
+    foreign_active = true;
     mp_thread_mutex_unlock(&thread_mutex);
 }
 
@@ -226,6 +228,7 @@ void mp_thread_foreign_stack_exit(void) {
             break;
         }
     }
+    foreign_active = false;
     mp_thread_mutex_unlock(&thread_mutex);
 }
 
@@ -318,6 +321,12 @@ void mp_thread_deinit(void) {
         }
     }
     thread = &thread_entry0;
+    // A NimBLE callback still in progress keeps its stack listed until it
+    // exits, so collections during BLE shutdown still see its objects.
+    if (foreign_active) {
+        foreign_entry.next = thread;
+        thread = &foreign_entry;
+    }
     mp_thread_mutex_unlock(&thread_mutex);
 
     // Give the idle task a chance to run, to clean up any deleted tasks.
