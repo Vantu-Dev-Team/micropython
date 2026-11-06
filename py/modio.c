@@ -64,7 +64,12 @@ static mp_obj_t iobase_call(void *ctx) {
     mp_load_method(call->obj, call->qst, dest);
     mp_obj_array_t ar = {{&mp_type_bytearray}, BYTEARRAY_TYPECODE, 0, call->size, call->buf};
     dest[2] = MP_OBJ_FROM_PTR(&ar);
-    return mp_call_method_n_kw(1, 0, dest);
+    mp_obj_t ret_obj = mp_call_method_n_kw(1, 0, dest);
+    if (ret_obj == mp_const_none) {
+        return ret_obj;
+    }
+    // Convert while ar is alive and pinned: __int__ may touch the buffer.
+    return mp_obj_new_int(mp_obj_get_int(ret_obj));
 }
 
 static mp_uint_t iobase_read_write(mp_obj_t obj, void *buf, mp_uint_t size, int *errcode, qstr qst) {

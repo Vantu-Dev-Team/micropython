@@ -411,6 +411,38 @@ static const uint8_t *_get_peer(mp_obj_t mac_addr) {
     return _get_bytes_len(mac_addr, ESP_NOW_ETH_ALEN);
 }
 
+// The receive ring is written by recv_cb() on the WiFi task (core 0) and read
+// by Python (core 1). Each side owns one cursor: it reads the other cursor
+// with an acquire load and publishes its own with a release store, so data is
+// complete before the cursor that exposes it, and is consumed before the space
+// is reused.
+static size_t espnow_ring_avail(ringbuf_t *r) {
+    uint16_t iput = __atomic_load_n(&r->iput, __ATOMIC_ACQUIRE);
+    return (r->size + iput - r->iget) % r->size;
+}
+
+static size_t espnow_ring_free(ringbuf_t *r) {
+    uint16_t iget = __atomic_load_n(&r->iget, __ATOMIC_ACQUIRE);
+    return (r->size + iget - r->iput - 1) % r->size;
+}
+
+static int espnow_ring_get(ringbuf_t *r, uint8_t *data, size_t len) {
+    if (espnow_ring_avail(r) < len) {
+        return -1;
+    }
+    size_t pos = r->iget;
+    size_t first = MIN(len, (size_t)r->size - pos);
+    memcpy(data, r->buf + pos, first);
+    memcpy(data + first, r->buf, len - first);
+    __atomic_store_n(&r->iget, (uint16_t)((pos + len) % r->size), __ATOMIC_RELEASE);
+    return 0;
+}
+
+// Drop everything published so far (reader side only; never races recv_cb).
+static void espnow_ring_discard(ringbuf_t *r) {
+    __atomic_store_n(&r->iget, __atomic_load_n(&r->iput, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+}
+
 // Wait until at least len bytes are queued, without consuming them.
 // Callbacks run in the poll hook and may deactivate ESPNow, so the ring
 // buffer is looked up again on every iteration.
@@ -421,10 +453,7 @@ static bool espnow_wait_available(esp_espnow_obj_t *self, size_t len, mp_int_t t
         if (self->recv_buffer == NULL) {
             check_esp_err(ESP_ERR_ESPNOW_NOT_INIT);
         }
-        if ((size_t)ringbuf_avail(self->recv_buffer) >= len) {
-            // Pairs with the release store in recv_cb(): the packet bytes
-            // are visible once iput is.
-            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (espnow_ring_avail(self->recv_buffer) >= len) {
             return true;
         }
         if (timeout_ms >= 0 && (mp_uint_t)(mp_hal_ticks_ms() - start) >= (mp_uint_t)timeout_ms) {
@@ -484,7 +513,7 @@ static mp_obj_t espnow_recvinto(size_t n_args, const mp_obj_t *args) {
 
     // Read the packet header from the incoming buffer (already available)
     espnow_hdr_t hdr;
-    if (ringbuf_get_bytes(self->recv_buffer, (uint8_t *)&hdr, sizeof(hdr)) < 0) {
+    if (espnow_ring_get(self->recv_buffer, (uint8_t *)&hdr, sizeof(hdr)) < 0) {
         return MP_OBJ_NEW_SMALL_INT(0);
     }
     int msg_len = hdr.msg_len;
@@ -493,9 +522,9 @@ static mp_obj_t espnow_recvinto(size_t n_args, const mp_obj_t *args) {
     // and then read the message data
     if (hdr.magic != ESPNOW_MAGIC
         || msg_len > msg_buf.len
-        || ringbuf_get_bytes(self->recv_buffer, peer_buf, ESP_NOW_ETH_ALEN) < 0
-        || ringbuf_get_bytes(self->recv_buffer, msg_buf.buf, msg_len) < 0) {
-        ringbuf_reset(self->recv_buffer); // Prevent ringbuffer getting out of sync
+        || espnow_ring_get(self->recv_buffer, peer_buf, ESP_NOW_ETH_ALEN) < 0
+        || espnow_ring_get(self->recv_buffer, msg_buf.buf, msg_len) < 0) {
+        espnow_ring_discard(self->recv_buffer); // Prevent ringbuffer getting out of sync
         mp_raise_ValueError(MP_ERROR_TEXT("ESPNow.recv(): buffer error"));
     }
     if (mp_obj_is_type(msg, &mp_type_bytearray)) {
@@ -523,7 +552,7 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(espnow_recvinto_obj, 2, 3, espnow_rec
 static mp_obj_t espnow_any(const mp_obj_t _) {
     esp_espnow_obj_t *self = _get_singleton_initialised();
 
-    return ringbuf_avail(self->recv_buffer) ? mp_const_true : mp_const_false;
+    return espnow_ring_avail(self->recv_buffer) ? mp_const_true : mp_const_false;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(espnow_any_obj, espnow_any);
 
@@ -652,7 +681,7 @@ static void recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *msg, in
         return;
     }
     // TODO: Test this works with ">".
-    if (sizeof(espnow_pkt_t) + msg_len >= ringbuf_free(buf)) {
+    if (sizeof(espnow_pkt_t) + msg_len >= espnow_ring_free(buf)) {
         self->dropped_rx_pkts++;
         return;
     }
@@ -928,7 +957,7 @@ static mp_uint_t espnow_stream_ioctl(
     return (self->recv_buffer == NULL) ? 0 :  // If not initialised
            arg ^ (
                // If no data in the buffer, unset the Read ready flag
-               ((ringbuf_avail(self->recv_buffer) == 0) ? MP_STREAM_POLL_RD : 0) |
+               ((espnow_ring_avail(self->recv_buffer) == 0) ? MP_STREAM_POLL_RD : 0) |
                // If still waiting for responses, unset the Write ready flag
                ((self->tx_responses < self->tx_packets) ? MP_STREAM_POLL_WR : 0));
 }
