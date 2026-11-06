@@ -273,9 +273,12 @@ static int ssl_sock_cert_verify(void *ptr, mbedtls_x509_crt *crt, int depth, uin
     if (o->handler == mp_const_none) {
         return 0;
     }
-    mp_obj_array_t cert;
-    mp_obj_memoryview_init(&cert, 'B', 0, crt->raw.len, crt->raw.p);
-    return mp_obj_get_int(mp_call_function_2(o->handler, MP_OBJ_FROM_PTR(&cert), MP_OBJ_NEW_SMALL_INT(depth)));
+    // The handler may keep its argument: give it a view of a GC-owned copy
+    // of the certificate, not of mbedTLS storage via a stack object.
+    byte *der = m_new(byte, crt->raw.len ? crt->raw.len : 1);
+    memcpy(der, crt->raw.p, crt->raw.len);
+    mp_obj_t cert = mp_obj_new_memoryview('B', crt->raw.len, der);
+    return mp_obj_get_int(mp_call_function_2(o->handler, cert, MP_OBJ_NEW_SMALL_INT(depth)));
 }
 
 /******************************************************************************/

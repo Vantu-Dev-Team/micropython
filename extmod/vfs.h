@@ -88,6 +88,10 @@ typedef struct _mp_vfs_blockdev_t {
             mp_obj_t count[2];
         } old;
     } u;
+    // Largest heap copy handed to a Python method, reused when a new copy
+    // cannot be allocated (e.g. heap locked in a finaliser).
+    struct _mp_obj_array_t *spare;
+    size_t spare_size;
 } mp_vfs_blockdev_t;
 
 typedef struct _mp_vfs_mount_t {

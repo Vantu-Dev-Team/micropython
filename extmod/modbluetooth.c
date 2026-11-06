@@ -1139,17 +1139,24 @@ static MP_DEFINE_CONST_FUN_OBJ_1(bluetooth_ble_invoke_irq_obj, bluetooth_ble_inv
 
 #if MICROPY_PY_BLUETOOTH_USE_SYNC_EVENTS
 
+static mp_obj_t bluetooth_copy_view(const uint8_t *src, size_t len) {
+    byte *copy = m_new(byte, len ? len : 1);
+    memcpy(copy, src, len);
+    return mp_obj_new_memoryview('B', len, copy);
+}
+
 static mp_obj_t invoke_irq_handler_run(uint16_t event,
     const mp_int_t *numeric, size_t n_unsigned, size_t n_signed,
     const uint8_t *addr,
     const mp_obj_bluetooth_uuid_t *uuid,
     const uint8_t **data, uint16_t *data_len, size_t n_data) {
 
-    mp_obj_array_t mv_addr;
-    mp_obj_array_t mv_data[2];
+    // The handler may keep the tuple or its items beyond this call: build
+    // them from GC-owned copies instead of stack objects and stack/NimBLE
+    // buffers.
     assert(n_data <= 2);
 
-    mp_obj_tuple_t *data_tuple = mp_local_alloc(sizeof(mp_obj_tuple_t) + sizeof(mp_obj_t) * MICROPY_PY_BLUETOOTH_MAX_EVENT_DATA_TUPLE_LEN);
+    mp_obj_tuple_t *data_tuple = m_malloc(sizeof(mp_obj_tuple_t) + sizeof(mp_obj_t) * MICROPY_PY_BLUETOOTH_MAX_EVENT_DATA_TUPLE_LEN);
     data_tuple->base.type = &mp_type_tuple;
     data_tuple->len = 0;
 
@@ -1157,8 +1164,7 @@ static mp_obj_t invoke_irq_handler_run(uint16_t event,
         data_tuple->items[data_tuple->len++] = MP_OBJ_NEW_SMALL_INT(numeric[i]);
     }
     if (addr) {
-        mp_obj_memoryview_init(&mv_addr, 'B', 0, 6, (void *)addr);
-        data_tuple->items[data_tuple->len++] = MP_OBJ_FROM_PTR(&mv_addr);
+        data_tuple->items[data_tuple->len++] = bluetooth_copy_view(addr, 6);
     }
     for (size_t i = 0; i < n_signed; ++i) {
         data_tuple->items[data_tuple->len++] = MP_OBJ_NEW_SMALL_INT(numeric[i + n_unsigned]);
@@ -1198,8 +1204,7 @@ static mp_obj_t invoke_irq_handler_run(uint16_t event,
 
     for (size_t i = 0; i < n_data; ++i) {
         if (data[i]) {
-            mp_obj_memoryview_init(&mv_data[i], 'B', 0, data_len[i], (void *)data[i]);
-            data_tuple->items[data_tuple->len++] = MP_OBJ_FROM_PTR(&mv_data[i]);
+            data_tuple->items[data_tuple->len++] = bluetooth_copy_view(data[i], data_len[i]);
         } else {
             data_tuple->items[data_tuple->len++] = mp_const_none;
         }
@@ -1211,12 +1216,11 @@ static mp_obj_t invoke_irq_handler_run(uint16_t event,
     mp_obj_t result = mp_call_function_2(o->irq_handler, MP_OBJ_NEW_SMALL_INT(event), MP_OBJ_FROM_PTR(data_tuple));
 
     #if MICROPY_PY_BLUETOOTH_USE_GATTC_EVENT_DATA_REASSEMBLY
+    // Only copied from (above), never handed to Python: safe to free now.
     if (buf_to_free != NULL) {
         m_del(uint8_t, (uint8_t *)buf_to_free, buf_to_free_len);
     }
     #endif
-
-    mp_local_free(data_tuple);
 
     return result;
 }
