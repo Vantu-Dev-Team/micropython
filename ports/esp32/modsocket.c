@@ -51,6 +51,7 @@
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "lwip/dns.h"
 #include "lwip/ip4.h"
 #include "lwip/igmp.h"
 #include "esp_log.h"
@@ -170,6 +171,11 @@ static int mdns_getaddrinfo(const char *host_str, const char *port_str,
     if (host_len <= local_len ||
         strcasecmp(host_str + host_len - local_len, MDNS_LOCAL_SUFFIX) != 0) {
         return 0;
+    }
+
+    if (host_len >= DNS_MAX_NAME_LENGTH) {
+        *res = NULL;
+        return EAI_NONAME;
     }
 
     // mDNS query
