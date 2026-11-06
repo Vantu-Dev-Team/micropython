@@ -422,6 +422,9 @@ static bool espnow_wait_available(esp_espnow_obj_t *self, size_t len, mp_int_t t
             check_esp_err(ESP_ERR_ESPNOW_NOT_INIT);
         }
         if ((size_t)ringbuf_avail(self->recv_buffer) >= len) {
+            // Pairs with the release store in recv_cb(): the packet bytes
+            // are visible once iput is.
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
             return true;
         }
         if (timeout_ms >= 0 && (mp_uint_t)(mp_hal_ticks_ms() - start) >= (mp_uint_t)timeout_ms) {
@@ -448,8 +451,17 @@ static mp_obj_t espnow_recvinto(size_t n_args, const mp_obj_t *args) {
             ? mp_obj_get_int(args[2]) : _get_singleton()->recv_timeout_ms);
     esp_espnow_obj_t *self = _get_singleton_initialised();
 
-    // Wait for a whole header before borrowing any buffer: callbacks run
-    // while waiting and may resize them or deactivate ESPNow.
+    // Validate the arguments now so bad calls fail without waiting; they are
+    // looked up again after the wait.
+    {
+        mp_obj_list_t *check = mp_obj_list_ensure(args[1], 2);
+        mp_buffer_info_t check_buf;
+        mp_get_buffer_raise(check->items[1], &check_buf, MP_BUFFER_WRITE);
+    }
+
+    // Wait for a whole packet (published atomically by recv_cb) before
+    // borrowing any buffer: callbacks run while waiting and may resize them
+    // or deactivate ESPNow.
     if (!espnow_wait_available(self, sizeof(espnow_hdr_t), timeout_ms)) {
         return MP_OBJ_NEW_SMALL_INT(0);    // Timeout waiting for packet
     }
@@ -625,9 +637,20 @@ static void send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t st
 // ESPNow packet.
 // If the buffer is full, drop the message and increment the dropped count.
 // Schedules the user callback if one has been registered (ESPNow.config()).
+// Copy len bytes into the ring at *pos without publishing them.
+static void ringbuf_copy_unpublished(ringbuf_t *r, size_t *pos, const uint8_t *data, size_t len) {
+    size_t first = MIN(len, (size_t)r->size - *pos);
+    memcpy(r->buf + *pos, data, first);
+    memcpy(r->buf, data + first, len - first);
+    *pos = (*pos + len) % r->size;
+}
+
 static void recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *msg, int msg_len) {
     esp_espnow_obj_t *self = _get_singleton();
     ringbuf_t *buf = self->recv_buffer;
+    if (buf == NULL) {
+        return;
+    }
     // TODO: Test this works with ">".
     if (sizeof(espnow_pkt_t) + msg_len >= ringbuf_free(buf)) {
         self->dropped_rx_pkts++;
@@ -641,9 +664,13 @@ static void recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *msg, in
     header.time_ms = mp_hal_ticks_ms();
     #endif // MICROPY_PY_ESPNOW_RSSI
 
-    ringbuf_put_bytes(buf, (uint8_t *)&header, sizeof(header));
-    ringbuf_put_bytes(buf, recv_info->src_addr, ESP_NOW_ETH_ALEN);
-    ringbuf_put_bytes(buf, msg, msg_len);
+    // The reader runs on the other core: copy the complete packet first, then
+    // publish it with a single store so a header never appears without its body.
+    size_t pos = buf->iput;
+    ringbuf_copy_unpublished(buf, &pos, (const uint8_t *)&header, sizeof(header));
+    ringbuf_copy_unpublished(buf, &pos, recv_info->src_addr, ESP_NOW_ETH_ALEN);
+    ringbuf_copy_unpublished(buf, &pos, msg, msg_len);
+    __atomic_store_n(&buf->iput, (uint16_t)pos, __ATOMIC_RELEASE);
     self->rx_packets++;
     if (self->recv_cb != mp_const_none) {
         mp_sched_schedule(self->recv_cb, self->recv_cb_arg);

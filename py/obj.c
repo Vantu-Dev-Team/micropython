@@ -640,7 +640,8 @@ void mp_buffer_unpin(int slot) {
 mp_obj_t mp_buffer_pinned_call(const void *buf1, size_t len1, const void *buf2, size_t len2,
     mp_obj_t (*fn)(void *ctx), void *ctx) {
     int slot1 = mp_buffer_pin(buf1, len1);
-    int slot2 = -1;
+    // Modified after nlr_push (setjmp): must be volatile to be read back on the exception path.
+    volatile int slot2 = -1;
     nlr_buf_t nlr;
     if (nlr_push(&nlr) == 0) {
         slot2 = mp_buffer_pin(buf2, len2);

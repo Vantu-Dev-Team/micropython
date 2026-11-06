@@ -51,12 +51,27 @@ static mp_obj_t iobase_make_new(const mp_obj_type_t *type, size_t n_args, size_t
     return MP_OBJ_FROM_PTR(&iobase_singleton);
 }
 
-static mp_uint_t iobase_read_write(mp_obj_t obj, void *buf, mp_uint_t size, int *errcode, qstr qst) {
+typedef struct _iobase_call_t {
+    mp_obj_t obj;
+    void *buf;
+    mp_uint_t size;
+    qstr qst;
+} iobase_call_t;
+
+static mp_obj_t iobase_call(void *ctx) {
+    iobase_call_t *call = ctx;
     mp_obj_t dest[3];
-    mp_load_method(obj, qst, dest);
-    mp_obj_array_t ar = {{&mp_type_bytearray}, BYTEARRAY_TYPECODE, 0, size, buf};
+    mp_load_method(call->obj, call->qst, dest);
+    mp_obj_array_t ar = {{&mp_type_bytearray}, BYTEARRAY_TYPECODE, 0, call->size, call->buf};
     dest[2] = MP_OBJ_FROM_PTR(&ar);
-    mp_obj_t ret_obj = mp_call_method_n_kw(1, 0, dest);
+    return mp_call_method_n_kw(1, 0, dest);
+}
+
+static mp_uint_t iobase_read_write(mp_obj_t obj, void *buf, mp_uint_t size, int *errcode, qstr qst) {
+    // buf may be native (e.g. TLS) storage wrapped as a bytearray: pin it so
+    // the Python method cannot grow (reallocate) it.
+    iobase_call_t call = { obj, buf, size, qst };
+    mp_obj_t ret_obj = mp_buffer_pinned_call(buf, size, NULL, 0, iobase_call, &call);
     if (ret_obj == mp_const_none) {
         *errcode = MP_EAGAIN;
         return MP_STREAM_ERROR;
