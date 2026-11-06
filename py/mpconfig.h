@@ -1311,6 +1311,13 @@ typedef time_t mp_timestamp_t;
 #define MICROPY_PY_BOUND_METHOD_FULL_EQUALITY_CHECK (0)
 #endif
 
+// Number of buffers native I/O can pin at once. A pinned bytearray/array
+// cannot be reallocated while native code holds its storage across a GIL
+// release or callbacks; growing it raises RuntimeError. 0 disables pinning.
+#ifndef MICROPY_BUFFER_PIN_MAX
+#define MICROPY_BUFFER_PIN_MAX (0)
+#endif
+
 // Whether to support the descriptors __get__, __set__, __delete__, __set_name__
 // This costs some code size and makes load/store/delete of instance
 // attributes slower for the classes that use this feature

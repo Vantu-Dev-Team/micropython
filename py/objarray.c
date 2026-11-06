@@ -398,6 +398,7 @@ static mp_obj_t array_append(mp_obj_t self_in, mp_obj_t arg) {
         size_t item_sz = mp_binary_get_size('@', self->typecode, NULL);
         // TODO: alloc policy
         size_t add_cnt = 8;
+        mp_buffer_check_move(self->items, item_sz * self->len);
         self->items = m_renew(byte, self->items, item_sz * self->len, item_sz * (self->len + add_cnt));
         self->free = add_cnt;
         mp_seq_clear(self->items, self->len + 1, self->len + self->free, item_sz);
@@ -431,6 +432,7 @@ static mp_obj_t array_extend(mp_obj_t self_in, mp_obj_t arg_in) {
     // make sure we have enough room to extend
     // TODO: alloc policy; at the moment we go conservative
     if (self->free < len) {
+        mp_buffer_check_move(self->items, (self->len + self->free) * sz);
         self->items = m_renew(byte, self->items, (self->len + self->free) * sz, (self->len + len) * sz);
         self->free = 0;
 
@@ -519,6 +521,7 @@ static mp_obj_t array_subscr(mp_obj_t self_in, mp_obj_t index_in, mp_obj_t value
                 if (len_adj > 0) {
                     if ((size_t)len_adj > o->free) {
                         // TODO: alloc policy; at the moment we go conservative
+                        mp_buffer_check_move(o->items, (o->len + o->free) * item_sz);
                         o->items = m_renew(byte, o->items, (o->len + o->free) * item_sz, (o->len + len_adj) * item_sz);
                         o->free = len_adj;
                         // m_renew may have moved o->items

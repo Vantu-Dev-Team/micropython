@@ -84,6 +84,9 @@
 #define MICROPY_PY_TIME_INCLUDEFILE         "ports/esp32/modtime.c"
 #define MICROPY_PY_THREAD                   (1)
 #define MICROPY_PY_THREAD_GIL               (1)
+// Native I/O (sockets, streams, SPI, ESP-NOW) pins borrowed buffers so
+// another thread or callback cannot reallocate them meanwhile.
+#define MICROPY_BUFFER_PIN_MAX              (16)
 #define MICROPY_PY_THREAD_GIL_VM_DIVISOR    (32)
 
 #define MICROPY_GC_SPLIT_HEAP               (1)

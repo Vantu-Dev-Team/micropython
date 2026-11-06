@@ -62,6 +62,10 @@ typedef struct _network_ppp_obj_t {
     network_ppp_state_t state;
     int error_code;
     mp_obj_t stream;
+    // lwIP keeps raw pointers to the credential strings; holding the objects
+    // here keeps them alive (and unmoved) as long as the PCB can use them.
+    mp_obj_t auth_user;
+    mp_obj_t auth_key;
     ppp_pcb *pcb;
     struct netif netif;
 } network_ppp_obj_t;
@@ -121,6 +125,8 @@ static mp_obj_t network_ppp_make_new(const mp_obj_type_t *type, size_t n_args, s
     network_ppp_obj_t *self = mp_obj_malloc_with_finaliser(network_ppp_obj_t, type);
     self->state = STATE_INACTIVE;
     self->stream = stream;
+    self->auth_user = mp_const_none;
+    self->auth_key = mp_const_none;
     self->pcb = NULL;
 
     return MP_OBJ_FROM_PTR(self);
@@ -336,8 +342,18 @@ static mp_obj_t network_ppp_connect(size_t n_args, const mp_obj_t *args, mp_map_
     }
 
     if (parsed_args[ARG_security].u_int != PPPAUTHTYPE_NONE) {
-        const char *user_str = mp_obj_str_get_str(parsed_args[ARG_user].u_obj);
-        const char *key_str = mp_obj_str_get_str(parsed_args[ARG_key].u_obj);
+        size_t user_len;
+        size_t key_len;
+        const char *user_str = mp_obj_str_get_data(parsed_args[ARG_user].u_obj, &user_len);
+        const char *key_str = mp_obj_str_get_data(parsed_args[ARG_key].u_obj, &key_len);
+        // CHAP copies the name into a response of RESP_MAX_PKTLEN bytes,
+        // sized for MAXNAMELEN; PAP lengths are one byte. Reject anything
+        // longer instead of overflowing those packets.
+        if (user_len >= MAXNAMELEN || key_len >= MAXSECRETLEN) {
+            mp_raise_ValueError(MP_ERROR_TEXT("user or key too long"));
+        }
+        self->auth_user = parsed_args[ARG_user].u_obj;
+        self->auth_key = parsed_args[ARG_key].u_obj;
         pppapi_set_auth(self->pcb, parsed_args[ARG_security].u_int, user_str, key_str);
     }
 

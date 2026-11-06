@@ -411,18 +411,24 @@ static const uint8_t *_get_peer(mp_obj_t mac_addr) {
     return _get_bytes_len(mac_addr, ESP_NOW_ETH_ALEN);
 }
 
-// Copy data from the ring buffer - wait if buffer is empty up to timeout_ms
-//    0: Success
-//   -1: Not enough data available to complete read (try again later)
-//   -2: Requested read is larger than buffer - will never succeed
-static int ringbuf_get_bytes_wait(ringbuf_t *r, uint8_t *data, size_t len, mp_int_t timeout_ms) {
+// Wait until at least len bytes are queued, without consuming them.
+// Callbacks run in the poll hook and may deactivate ESPNow, so the ring
+// buffer is looked up again on every iteration.
+// Returns true when the data is available, false on timeout.
+static bool espnow_wait_available(esp_espnow_obj_t *self, size_t len, mp_int_t timeout_ms) {
     mp_uint_t start = mp_hal_ticks_ms();
-    int status = 0;
-    while (((status = ringbuf_get_bytes(r, data, len)) == -1)
-           && (timeout_ms < 0 || (mp_uint_t)(mp_hal_ticks_ms() - start) < (mp_uint_t)timeout_ms)) {
+    for (;;) {
+        if (self->recv_buffer == NULL) {
+            check_esp_err(ESP_ERR_ESPNOW_NOT_INIT);
+        }
+        if ((size_t)ringbuf_avail(self->recv_buffer) >= len) {
+            return true;
+        }
+        if (timeout_ms >= 0 && (mp_uint_t)(mp_hal_ticks_ms() - start) >= (mp_uint_t)timeout_ms) {
+            return false;
+        }
         MICROPY_EVENT_POLL_HOOK;
     }
-    return status;
 }
 
 // ESPNow.recvinto(buffers[, timeout_ms]):
@@ -437,11 +443,18 @@ static int ringbuf_get_bytes_wait(ringbuf_t *r, uint8_t *data, size_t len, mp_in
 // Default timeout is set with ESPNow.config(timeout=milliseconds).
 // Return (None, None) on timeout.
 static mp_obj_t espnow_recvinto(size_t n_args, const mp_obj_t *args) {
+    // Convert the timeout first: its __int__ may run arbitrary Python code.
+    mp_int_t timeout_ms = ((n_args > 2 && args[2] != mp_const_none)
+            ? mp_obj_get_int(args[2]) : _get_singleton()->recv_timeout_ms);
     esp_espnow_obj_t *self = _get_singleton_initialised();
 
-    mp_int_t timeout_ms = ((n_args > 2 && args[2] != mp_const_none)
-            ? mp_obj_get_int(args[2]) : self->recv_timeout_ms);
+    // Wait for a whole header before borrowing any buffer: callbacks run
+    // while waiting and may resize them or deactivate ESPNow.
+    if (!espnow_wait_available(self, sizeof(espnow_hdr_t), timeout_ms)) {
+        return MP_OBJ_NEW_SMALL_INT(0);    // Timeout waiting for packet
+    }
 
+    // From here on no Python code runs until the message is copied.
     mp_obj_list_t *list = mp_obj_list_ensure(args[1], 2);
     mp_obj_array_t *msg = MP_OBJ_TO_PTR(list->items[1]);
     mp_buffer_info_t msg_buf;
@@ -457,10 +470,10 @@ static mp_obj_t espnow_recvinto(size_t n_args, const mp_obj_t *args) {
 
     mp_get_buffer_raise(msg, &msg_buf, MP_BUFFER_WRITE);
 
-    // Read the packet header from the incoming buffer
+    // Read the packet header from the incoming buffer (already available)
     espnow_hdr_t hdr;
-    if (ringbuf_get_bytes_wait(self->recv_buffer, (uint8_t *)&hdr, sizeof(hdr), timeout_ms) < 0) {
-        return MP_OBJ_NEW_SMALL_INT(0);    // Timeout waiting for packet
+    if (ringbuf_get_bytes(self->recv_buffer, (uint8_t *)&hdr, sizeof(hdr)) < 0) {
+        return MP_OBJ_NEW_SMALL_INT(0);
     }
     int msg_len = hdr.msg_len;
 
@@ -530,16 +543,37 @@ static void _wait_for_pending_responses(esp_espnow_obj_t *self) {
 //   True  if sync==True and message is received successfully by all recipients
 //   False if sync==True and message is not received by at least one recipient
 // Raises: EAGAIN if the internal espnow buffers are full.
+typedef struct _espnow_send_call_t {
+    const uint8_t *peer;
+    mp_buffer_info_t message;
+} espnow_send_call_t;
+
+static mp_obj_t espnow_send_call(void *ctx) {
+    espnow_send_call_t *call = ctx;
+    // Send the packet - try, try again if internal esp-now buffers are full.
+    // The poll hook runs callbacks; the message is pinned meanwhile.
+    esp_err_t err;
+    mp_uint_t start = mp_hal_ticks_ms();
+    while ((ESP_ERR_ESPNOW_NO_MEM == (err = esp_now_send(call->peer, call->message.buf, call->message.len)))
+           && (mp_uint_t)(mp_hal_ticks_ms() - start) < (mp_uint_t)DEFAULT_SEND_TIMEOUT_MS) {
+        MICROPY_EVENT_POLL_HOOK;
+    }
+    check_esp_err(err);           // Will raise OSError if e != ESP_OK
+    return mp_const_none;
+}
+
 static mp_obj_t espnow_send(size_t n_args, const mp_obj_t *args) {
     esp_espnow_obj_t *self = _get_singleton_initialised();
-    // Check the various combinations of input arguments
-    const uint8_t *peer = (n_args > 2 && args[1] != mp_const_none) ? _get_peer(args[1]) : NULL;
+    // Check the various combinations of input arguments. Copy the peer
+    // address: callbacks run while waiting below.
+    uint8_t peer_copy[ESP_NOW_ETH_ALEN];
+    const uint8_t *peer = NULL;
+    if (n_args > 2 && args[1] != mp_const_none) {
+        memcpy(peer_copy, _get_peer(args[1]), ESP_NOW_ETH_ALEN);
+        peer = peer_copy;
+    }
     mp_obj_t msg = (n_args > 2) ? args[2] : (n_args == 2) ? args[1] : MP_OBJ_NULL;
     bool sync = n_args <= 3 || args[3] == mp_const_none || mp_obj_is_true(args[3]);
-
-    // Get a pointer to the data buffer of the message
-    mp_buffer_info_t message;
-    mp_get_buffer_raise(msg, &message, MP_BUFFER_READ);
 
     if (sync) {
         // Flush out any pending responses.
@@ -549,15 +583,12 @@ static mp_obj_t espnow_send(size_t n_args, const mp_obj_t *args) {
         // call has sync=True.
         _wait_for_pending_responses(self);
     }
+    // Get a pointer to the data buffer of the message only after waiting.
+    espnow_send_call_t call;
+    call.peer = peer;
+    mp_get_buffer_raise(msg, &call.message, MP_BUFFER_READ);
     int saved_failures = self->tx_failures;
-    // Send the packet - try, try again if internal esp-now buffers are full.
-    esp_err_t err;
-    mp_uint_t start = mp_hal_ticks_ms();
-    while ((ESP_ERR_ESPNOW_NO_MEM == (err = esp_now_send(peer, message.buf, message.len)))
-           && (mp_uint_t)(mp_hal_ticks_ms() - start) < (mp_uint_t)DEFAULT_SEND_TIMEOUT_MS) {
-        MICROPY_EVENT_POLL_HOOK;
-    }
-    check_esp_err(err);           // Will raise OSError if e != ESP_OK
+    mp_buffer_pinned_call(call.message.buf, call.message.len, NULL, 0, espnow_send_call, &call);
     // Increment the sent packet count. If peer_addr==NULL msg will be
     // sent to all peers EXCEPT any broadcast or multicast addresses.
     self->tx_packets += ((peer == NULL) ? self->peer_count : 1);
