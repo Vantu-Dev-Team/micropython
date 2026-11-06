@@ -24,6 +24,8 @@
  * THE SOFTWARE.
  */
 
+#include <string.h>
+
 #include "py/runtime.h"
 #include "py/binary.h"
 #include "py/objarray.h"
@@ -46,29 +48,63 @@ void mp_vfs_blockdev_init(mp_vfs_blockdev_t *self, mp_obj_t bdev) {
     }
 }
 
+static bool mp_vfs_blockdev_is_native_fun(mp_obj_t fun) {
+    const mp_obj_type_t *type = mp_obj_get_type(fun);
+    return type == &mp_type_fun_builtin_0 || type == &mp_type_fun_builtin_1
+           || type == &mp_type_fun_builtin_2 || type == &mp_type_fun_builtin_3
+           || type == &mp_type_fun_builtin_var;
+}
+
 // Helper function to minimise code size of read/write functions
 // note the n_args argument is moved to the end for further code size reduction (args keep same position in caller and callee).
-static int mp_vfs_blockdev_call_rw(mp_obj_t *args, size_t block_num, size_t block_off, size_t len, void *buf, size_t n_args) {
+static int mp_vfs_blockdev_call_rw(mp_obj_t *args, size_t block_num, size_t block_off, size_t len, void *buf, bool is_read, size_t n_args) {
+    // buf is filesystem-driver storage that is only valid during this call.
+    // Native C methods get a zero-copy view; a Python method gets a view of a
+    // GC-owned copy, so keeping the argument after returning stays safe.
+    // When the heap is locked (e.g. a file flushed from a GC finaliser) no
+    // copy can be made; fall back to the zero-copy view rather than fail I/O.
+    void *items = buf;
+    mp_obj_array_t *heap_view = NULL;
+    if (!mp_vfs_blockdev_is_native_fun(args[0])) {
+        void *copy = m_malloc_maybe(len ? len : 1);
+        if (copy != NULL) {
+            heap_view = m_new_obj_maybe(mp_obj_array_t);
+        }
+        if (heap_view != NULL) {
+            items = copy;
+            memcpy(items, buf, len);
+        }
+    }
     #if MICROPY_PY_BUILTINS_MEMORYVIEW
-    mp_obj_array_t ar = {{&mp_type_memoryview}, 'B' | MP_OBJ_ARRAY_TYPECODE_FLAG_RW, 0, len, buf};
+    mp_obj_array_t ar = {{&mp_type_memoryview}, 'B' | MP_OBJ_ARRAY_TYPECODE_FLAG_RW, 0, len, items};
     #else
-    mp_obj_array_t ar = {{&mp_type_bytearray}, BYTEARRAY_TYPECODE, 0, len, buf};
+    mp_obj_array_t ar = {{&mp_type_bytearray}, BYTEARRAY_TYPECODE, 0, len, items};
     #endif
+    mp_obj_t view = MP_OBJ_FROM_PTR(&ar);
+    if (heap_view != NULL) {
+        *heap_view = ar;
+        view = MP_OBJ_FROM_PTR(heap_view);
+    }
     args[2] = MP_OBJ_NEW_SMALL_INT(block_num);
-    args[3] = MP_OBJ_FROM_PTR(&ar);
+    args[3] = view;
     args[4] = MP_OBJ_NEW_SMALL_INT(block_off); // ignored for n_args == 2
     mp_obj_t ret = mp_call_method_n_kw(n_args, 0, args);
+    // Copy back before converting ret (which may raise): the zero-copy path
+    // exposes the filled data to the driver whatever the result is.
+    if (is_read && items != buf) {
+        memcpy(buf, items, len);
+    }
 
-    if (ret == mp_const_none) {
-        return 0;
-    } else {
+    int i = 0;
+    if (ret != mp_const_none) {
         // Block device functions are expected to return 0 on success
         // and negative integer on errors. Check for positive integer
         // results as some callers (i.e. littlefs) will produce corrupt
         // results from these.
-        int i = mp_obj_get_int(ret);
-        return i > 0 ? (-MP_EINVAL) : i;
+        i = mp_obj_get_int(ret);
+        i = i > 0 ? (-MP_EINVAL) : i;
     }
+    return i;
 }
 
 int mp_vfs_blockdev_read(mp_vfs_blockdev_t *self, size_t block_num, size_t num_blocks, uint8_t *buf) {
@@ -79,11 +115,11 @@ int mp_vfs_blockdev_read(mp_vfs_blockdev_t *self, size_t block_num, size_t num_b
     }
     #endif
 
-    return mp_vfs_blockdev_call_rw(self->readblocks, block_num, 0, num_blocks * self->block_size, buf, 2);
+    return mp_vfs_blockdev_call_rw(self->readblocks, block_num, 0, num_blocks * self->block_size, buf, true, 2);
 }
 
 int mp_vfs_blockdev_read_ext(mp_vfs_blockdev_t *self, size_t block_num, size_t block_off, size_t len, uint8_t *buf) {
-    return mp_vfs_blockdev_call_rw(self->readblocks, block_num, block_off, len, buf, 3);
+    return mp_vfs_blockdev_call_rw(self->readblocks, block_num, block_off, len, buf, true, 3);
 }
 
 int mp_vfs_blockdev_write(mp_vfs_blockdev_t *self, size_t block_num, size_t num_blocks, const uint8_t *buf) {
@@ -99,7 +135,7 @@ int mp_vfs_blockdev_write(mp_vfs_blockdev_t *self, size_t block_num, size_t num_
     }
     #endif
 
-    return mp_vfs_blockdev_call_rw(self->writeblocks, block_num, 0, num_blocks * self->block_size, (void *)buf, 2);
+    return mp_vfs_blockdev_call_rw(self->writeblocks, block_num, 0, num_blocks * self->block_size, (void *)buf, false, 2);
 }
 
 int mp_vfs_blockdev_write_ext(mp_vfs_blockdev_t *self, size_t block_num, size_t block_off, size_t len, const uint8_t *buf) {
@@ -107,7 +143,7 @@ int mp_vfs_blockdev_write_ext(mp_vfs_blockdev_t *self, size_t block_num, size_t 
         // read-only block device
         return -MP_EROFS;
     }
-    return mp_vfs_blockdev_call_rw(self->writeblocks, block_num, block_off, len, (void *)buf, 3);
+    return mp_vfs_blockdev_call_rw(self->writeblocks, block_num, block_off, len, (void *)buf, false, 3);
 }
 
 mp_obj_t mp_vfs_blockdev_ioctl(mp_vfs_blockdev_t *self, uintptr_t cmd, uintptr_t arg) {

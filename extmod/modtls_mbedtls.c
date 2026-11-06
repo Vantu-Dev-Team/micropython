@@ -1092,8 +1092,10 @@ int micropy_mbedtls_ecdsa_sign_alt(const mbedtls_mpi *d, const unsigned char *ha
     mp_buffer_info_t sig_buf;
     if (nlr_push(&nlr) == 0) {
         mp_obj_t ret = mp_call_function_2(ssl_ctx->ecdsa_sign_callback,
-            mp_obj_new_bytearray_by_ref(klen, (void *)key),
-            mp_obj_new_bytearray_by_ref(hlen, (void *)hash));
+            // Copies: key lives on this C stack frame and hash in mbedTLS;
+            // the callback may keep or grow its arguments.
+            mp_obj_new_bytearray(klen, key),
+            mp_obj_new_bytearray(hlen, hash));
         if (ret == mp_const_none) {
             // key couldn't be used by the alternative implementation.
             nlr_pop();

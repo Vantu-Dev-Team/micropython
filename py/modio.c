@@ -51,32 +51,16 @@ static mp_obj_t iobase_make_new(const mp_obj_type_t *type, size_t n_args, size_t
     return MP_OBJ_FROM_PTR(&iobase_singleton);
 }
 
-typedef struct _iobase_call_t {
-    mp_obj_t obj;
-    void *buf;
-    mp_uint_t size;
-    qstr qst;
-} iobase_call_t;
-
-static mp_obj_t iobase_call(void *ctx) {
-    iobase_call_t *call = ctx;
-    mp_obj_t dest[3];
-    mp_load_method(call->obj, call->qst, dest);
-    mp_obj_array_t ar = {{&mp_type_bytearray}, BYTEARRAY_TYPECODE, 0, call->size, call->buf};
-    dest[2] = MP_OBJ_FROM_PTR(&ar);
-    mp_obj_t ret_obj = mp_call_method_n_kw(1, 0, dest);
-    if (ret_obj == mp_const_none) {
-        return ret_obj;
-    }
-    // Convert while ar is alive and pinned: __int__ may touch the buffer.
-    return mp_obj_new_int(mp_obj_get_int(ret_obj));
-}
-
 static mp_uint_t iobase_read_write(mp_obj_t obj, void *buf, mp_uint_t size, int *errcode, qstr qst) {
-    // buf may be native (e.g. TLS) storage wrapped as a bytearray: pin it so
-    // the Python method cannot grow (reallocate) it.
-    iobase_call_t call = { obj, buf, size, qst };
-    mp_obj_t ret_obj = mp_buffer_pinned_call(buf, size, NULL, 0, iobase_call, &call);
+    // buf may be native storage (e.g. TLS records) that is only valid for the
+    // duration of this call. Hand the Python method a GC-owned copy instead of
+    // a by-reference wrapper: keeping, growing or taking a memoryview of the
+    // argument after the call then never touches freed or relocated memory.
+    mp_obj_t dest[3];
+    mp_load_method(obj, qst, dest);
+    mp_obj_t copy = mp_obj_new_bytearray(size, buf);
+    dest[2] = copy;
+    mp_obj_t ret_obj = mp_call_method_n_kw(1, 0, dest);
     if (ret_obj == mp_const_none) {
         *errcode = MP_EAGAIN;
         return MP_STREAM_ERROR;
@@ -86,6 +70,15 @@ static mp_uint_t iobase_read_write(mp_obj_t obj, void *buf, mp_uint_t size, int 
         if ((mp_uint_t)ret > size) {
             *errcode = MP_EIO;
             return MP_STREAM_ERROR;
+        }
+        if (qst == MP_QSTR_readinto && ret > 0) {
+            // The method (or __int__ above) may have resized the copy.
+            mp_obj_array_t *ar = MP_OBJ_TO_PTR(copy);
+            if ((mp_uint_t)ret > ar->len) {
+                *errcode = MP_EIO;
+                return MP_STREAM_ERROR;
+            }
+            memcpy(buf, ar->items, ret);
         }
         return ret;
     } else {
