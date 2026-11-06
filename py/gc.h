@@ -71,6 +71,7 @@ void *gc_alloc(size_t n_bytes, unsigned int alloc_flags);
 void gc_free(void *ptr); // does not call finaliser
 uint32_t gc_meta_bits(void *ptr);
 size_t gc_nbytes(const void *ptr);
+void *gc_ptr_head(const void *ptr);
 void *gc_realloc(void *ptr, size_t n_bytes, bool allow_move);
 
 typedef struct _gc_info_t {

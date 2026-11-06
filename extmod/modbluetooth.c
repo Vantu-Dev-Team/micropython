@@ -1171,7 +1171,10 @@ static mp_obj_t invoke_irq_handler_run(uint16_t event,
     }
     #if MICROPY_PY_BLUETOOTH_ENABLE_CENTRAL_MODE
     if (uuid) {
-        data_tuple->items[data_tuple->len++] = MP_OBJ_FROM_PTR(uuid);
+        // NimBLE may pass a stack UUID or one it later reuses.
+        mp_obj_bluetooth_uuid_t *uuid_copy = m_new_obj(mp_obj_bluetooth_uuid_t);
+        *uuid_copy = *uuid;
+        data_tuple->items[data_tuple->len++] = MP_OBJ_FROM_PTR(uuid_copy);
     }
     #endif
 
@@ -1277,6 +1280,11 @@ static mp_obj_t invoke_irq_handler(uint16_t event,
     mp_state_thread_t ts;
     if (ts_orig == NULL) {
         mp_thread_init_state(&ts, MICROPY_PY_BLUETOOTH_SYNC_EVENT_STACK_SIZE, NULL, NULL);
+        #ifdef MICROPY_PY_BLUETOOTH_SYNC_EVENT_GC_ENTER
+        // The handler may release the GIL (e.g. time.sleep); a collection on
+        // another thread must then still see objects held on this stack.
+        MICROPY_PY_BLUETOOTH_SYNC_EVENT_GC_ENTER((char *)&ts + sizeof(ts));
+        #endif
         MP_THREAD_GIL_ENTER();
     }
 
@@ -1286,6 +1294,9 @@ static mp_obj_t invoke_irq_handler(uint16_t event,
 
     if (ts_orig == NULL) {
         MP_THREAD_GIL_EXIT();
+        #ifdef MICROPY_PY_BLUETOOTH_SYNC_EVENT_GC_EXIT
+        MICROPY_PY_BLUETOOTH_SYNC_EVENT_GC_EXIT();
+        #endif
         mp_thread_set_state(ts_orig);
     }
 
