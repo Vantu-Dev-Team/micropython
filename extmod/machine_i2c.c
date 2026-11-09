@@ -53,7 +53,6 @@ static int mp_hal_i2c_scl_release(machine_i2c_obj_t *self) {
     uint32_t count = self->us_timeout;
 
     mp_hal_pin_od_high(self->scl);
-    mp_hal_i2c_delay(self);
     // For clock stretching, wait for the SCL pin to be released, with timeout.
     for (; mp_hal_pin_read(self->scl) == 0 && count; --count) {
         mp_hal_delay_us_fast(1);
@@ -61,6 +60,8 @@ static int mp_hal_i2c_scl_release(machine_i2c_obj_t *self) {
     if (count == 0) {
         return -MP_ETIMEDOUT;
     }
+    // Hold SCL high for a full period, counted from when it really is high.
+    mp_hal_i2c_delay(self);
     return 0; // success
 }
 
@@ -76,12 +77,77 @@ static int mp_hal_i2c_sda_read(machine_i2c_obj_t *self) {
     return mp_hal_pin_read(self->sda);
 }
 
+static int mp_hal_i2c_stop(machine_i2c_obj_t *self);
+
+// Release both lines after an error, without waiting for clock stretching again.
+static void soft_i2c_release_lines(machine_i2c_obj_t *self) {
+    mp_hal_pin_od_high(self->sda);
+    mp_hal_pin_od_high(self->scl);
+}
+
+// Recover a bus on which a target holds SDA low (typically in the middle of a
+// byte it is still shifting out).  If SDA is high nothing is done.  Otherwise
+// SCL is clocked (low, then released) up to 9 times until the target releases
+// SDA.  The sequence always ends with SCL low, followed by a STOP (SDA low,
+// SCL released, SDA released), so no START is ever generated on the way out.
+// return value:
+//    0 - bus is idle (SDA high)
+//   <0 - error, with errno being the negative of the return value:
+//        -MP_EBUSY if SDA is still low, -MP_ETIMEDOUT if SCL is held low
+static int mp_hal_i2c_bus_clear(machine_i2c_obj_t *self) {
+    mp_hal_i2c_sda_release(self);
+    int ret = mp_hal_i2c_scl_release(self);
+    if (ret != 0) {
+        return ret;
+    }
+    if (mp_hal_i2c_sda_read(self) != 0) {
+        return 0;
+    }
+    bool sda_released = false;
+    for (int i = 0; i < 9; ++i) {
+        mp_hal_i2c_scl_low(self);
+        mp_hal_i2c_delay(self);
+        if (mp_hal_i2c_sda_read(self) != 0) {
+            // Released while SCL is low: leave the loop with SCL still low.
+            sda_released = true;
+            break;
+        }
+        ret = mp_hal_i2c_scl_release(self);
+        if (ret != 0) {
+            return ret;
+        }
+    }
+    if (!sda_released) {
+        // The 9th rising edge was just generated: bring SCL low again so that
+        // the STOP below starts from SCL low.
+        mp_hal_i2c_scl_low(self);
+        mp_hal_i2c_delay(self);
+    }
+    ret = mp_hal_i2c_stop(self);
+    if (ret != 0) {
+        return ret;
+    }
+    if (mp_hal_i2c_sda_read(self) == 0) {
+        return -MP_EBUSY;
+    }
+    return 0;
+}
+
 static int mp_hal_i2c_start(machine_i2c_obj_t *self) {
     mp_hal_i2c_sda_release(self);
     mp_hal_i2c_delay(self);
     int ret = mp_hal_i2c_scl_release(self);
     if (ret != 0) {
         return ret;
+    }
+    if (mp_hal_i2c_sda_read(self) == 0) {
+        // A target holds SDA low: every address would be "acknowledged".
+        ret = mp_hal_i2c_bus_clear(self);
+        if (ret != 0) {
+            soft_i2c_release_lines(self);
+            return ret;
+        }
+        // Both lines are high and idle now, the START below is a normal one.
     }
     mp_hal_i2c_sda_low(self);
     mp_hal_i2c_delay(self);
@@ -103,8 +169,21 @@ static void mp_hal_i2c_init(machine_i2c_obj_t *self, uint32_t freq) {
     if (self->us_delay == 0) {
         self->us_delay = 1;
     }
+    // Enabling open-drain keeps the old output latch, so drive SCL low before
+    // SDA is enabled: any SDA edge then happens with SCL low (no START/STOP).
+    // The latch is written before and after the enable to be port-independent.
+    mp_hal_pin_od_low(self->scl);
     mp_hal_pin_open_drain(self->scl);
+    mp_hal_pin_od_low(self->scl);
+    mp_hal_i2c_delay(self);
+    mp_hal_pin_od_high(self->sda);
     mp_hal_pin_open_drain(self->sda);
+    mp_hal_pin_od_high(self->sda);
+    mp_hal_i2c_delay(self);
+    mp_hal_i2c_bus_clear(self); // ignore error, init cannot report it
+    // Unconditional STOP, entered with SCL low so it is not preceded by a START.
+    mp_hal_i2c_scl_low(self);
+    mp_hal_i2c_delay(self);
     mp_hal_i2c_stop(self); // ignore error
 }
 
@@ -196,11 +275,12 @@ int mp_machine_soft_i2c_transfer(mp_obj_base_t *self_in, uint16_t addr, size_t n
     // write the slave address
     ret = mp_hal_i2c_write_byte(self, (addr << 1) | (flags & MP_MACHINE_I2C_FLAG_READ));
     if (ret < 0) {
+        soft_i2c_release_lines(self);
         return ret;
     } else if (ret != 0) {
         // nack received, release the bus cleanly
-        mp_hal_i2c_stop(self);
-        return -MP_ENODEV;
+        ret = mp_hal_i2c_stop(self);
+        return ret != 0 ? ret : -MP_ENODEV;
     }
 
     int transfer_ret = 0;
@@ -212,6 +292,7 @@ int mp_machine_soft_i2c_transfer(mp_obj_base_t *self_in, uint16_t addr, size_t n
             while (len--) {
                 ret = mp_hal_i2c_read_byte(self, buf++, (n | len) == 0);
                 if (ret != 0) {
+                    soft_i2c_release_lines(self);
                     return ret;
                 }
             }
@@ -220,6 +301,7 @@ int mp_machine_soft_i2c_transfer(mp_obj_base_t *self_in, uint16_t addr, size_t n
             while (len--) {
                 ret = mp_hal_i2c_write_byte(self, *buf++);
                 if (ret < 0) {
+                    soft_i2c_release_lines(self);
                     return ret;
                 } else if (ret != 0) {
                     // nack received, stop sending
@@ -346,6 +428,11 @@ static mp_obj_t machine_i2c_scan(mp_obj_t self_in) {
         int ret = mp_machine_i2c_writeto(self, addr, NULL, 0, true);
         if (ret == 0) {
             mp_obj_list_append(list, MP_OBJ_NEW_SMALL_INT(addr));
+        } else if (ret == -MP_EBUSY || ret == -MP_ETIMEDOUT) {
+            // A stuck bus (SDA or SCL held low) must not look like an empty or
+            // a full bus, and with SCL held low each probe would otherwise
+            // wait for the full timeout.
+            mp_raise_OSError(-ret);
         }
         // This scan loop may run for some time, so process any pending events/exceptions,
         // or allow the port to run any necessary background tasks.  But do it as fast as
